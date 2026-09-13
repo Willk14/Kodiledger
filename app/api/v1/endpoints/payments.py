@@ -1,7 +1,9 @@
 from fastapi import APIRouter, HTTPException, status
 
 from app.schemas.mpesa import StkPushRequest, StkPushResponse
-from app.services.mpesa_service import mpesa_service
+from app.services.payment_initiation_service import (
+    payment_initiation_service,
+)
 
 
 router = APIRouter(
@@ -29,7 +31,7 @@ async def initiate_stk_push(
     """
 
     try:
-        response = await mpesa_service.initiate_stk_push(
+        response = await payment_initiation_service.initiate_mpesa_stk_push(
             phone_number=request.phone_number,
             amount=request.amount,
             account_reference="KodiLedger",
@@ -67,5 +69,3 @@ async def initiate_stk_push(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to initiate M-Pesa STK Push.",
         ) from exc
-
-    

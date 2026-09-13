@@ -7,17 +7,17 @@ import httpx
 from app.core.config import settings
 
 
-class MpesaService:
+class MpesaClient:
     """
-    Service responsible for communicating with Safaricom Daraja APIs.
+    Low-level client for Safaricom Daraja APIs.
 
     Responsibilities:
-    - Generate Daraja OAuth access tokens
-    - Generate STK Push passwords
-    - Initiate STK Push requests
+    - Validate Daraja configuration and STK Push inputs
+    - Generate OAuth access tokens
+    - Generate STK Push timestamp/password
+    - Submit STK Push requests
 
-    This service does NOT write to the database.
-    Payment confirmation is handled by the M-Pesa webhook.
+    This class does not access the database.
     """
 
     def __init__(self) -> None:
@@ -64,54 +64,42 @@ class MpesaService:
         if not self.shortcode:
             raise RuntimeError("MPESA_SHORTCODE is not configured.")
 
-    def _validate_phone_number(self, phone_number: str) -> None:
+    @staticmethod
+    def _validate_phone_number(phone_number: str) -> None:
         """Validate Kenyan phone number format used by Daraja."""
 
         if not phone_number.startswith("254"):
-            raise ValueError(
-                "Phone number must start with 254."
-            )
+            raise ValueError("Phone number must start with 254.")
 
         if len(phone_number) != 12:
-            raise ValueError(
-                "Phone number must contain exactly 12 digits."
-            )
+            raise ValueError("Phone number must contain exactly 12 digits.")
 
         if not phone_number.isdigit():
-            raise ValueError(
-                "Phone number must contain digits only."
-            )
+            raise ValueError("Phone number must contain digits only.")
 
-    def _validate_amount(self, amount: int) -> None:
+    @staticmethod
+    def _validate_amount(amount: int) -> None:
         """Validate STK Push amount."""
 
         if amount <= 0:
-            raise ValueError(
-                "STK Push amount must be greater than zero."
-            )
+            raise ValueError("STK Push amount must be greater than zero.")
 
     def _validate_callback_url(self) -> None:
         """Ensure a callback URL has been configured."""
 
         if not self.callback_url:
-            raise RuntimeError(
-                "MPESA_CALLBACK_URL is not configured."
-            )
+            raise RuntimeError("MPESA_CALLBACK_URL is not configured.")
 
     # ------------------------------------------------------------------
     # OAuth
     # ------------------------------------------------------------------
 
     async def get_access_token(self) -> str:
-        """
-        Request an OAuth access token from Daraja.
-        """
+        """Request an OAuth access token from Daraja."""
 
         self._validate_credentials()
 
-        credentials = (
-            f"{self.consumer_key}:{self.consumer_secret}"
-        )
+        credentials = f"{self.consumer_key}:{self.consumer_secret}"
 
         encoded_credentials = base64.b64encode(
             credentials.encode("utf-8")
@@ -131,7 +119,6 @@ class MpesaService:
         async with httpx.AsyncClient(
             timeout=self.timeout
         ) as client:
-
             response = await client.get(
                 url,
                 headers=headers,
@@ -178,9 +165,7 @@ class MpesaService:
         )
 
     def generate_password(self, timestamp: str) -> str:
-        """
-        Generate the Base64 encoded Daraja STK Push password.
-        """
+        """Generate the Base64 encoded Daraja STK Push password."""
 
         raw_password = (
             f"{self.shortcode}"
@@ -206,12 +191,8 @@ class MpesaService:
         """
         Initiate an M-Pesa STK Push.
 
-        Important:
-        This function only starts the payment request.
-        It does NOT mark the payment as completed.
-
-        Payment completion happens later through the M-Pesa
-        callback/webhook.
+        This method only starts the request.
+        Payment completion is handled by the webhook.
         """
 
         self._validate_credentials()
@@ -219,10 +200,8 @@ class MpesaService:
         self._validate_amount(amount)
         self._validate_callback_url()
 
-        # Get OAuth token.
         access_token = await self.get_access_token()
 
-        # Generate Daraja timestamp/password.
         timestamp = self.generate_timestamp()
         password = self.generate_password(timestamp)
 
@@ -253,7 +232,6 @@ class MpesaService:
         async with httpx.AsyncClient(
             timeout=self.timeout
         ) as client:
-
             response = await client.post(
                 url,
                 json=payload,
@@ -277,8 +255,4 @@ class MpesaService:
         return data
 
 
-# ----------------------------------------------------------------------
-# Shared service instance
-# ----------------------------------------------------------------------
-
-mpesa_service = MpesaService()
+mpesa_client = MpesaClient()

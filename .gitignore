@@ -1,0 +1,55 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+ENV/
+env/
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Coverage
+.coverage
+htmlcov/
+coverage.xml
+
+# Build
+build/
+dist/
+*.egg-info/
+
+# Node / frontend
+node_modules/
+.next/
+out/
+
+# Local databases
+*.sqlite
+*.sqlite3
+
+# Database backups
+db/backups/
+
+# Local synthetic/test payloads
+synthetic_callback_*.json

@@ -1,44 +1,55 @@
+from __future__ import annotations
+
 from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 
+# ============================================================
+# Repositories
+# ============================================================
+
+from app.repositories.invoice_repository import InvoiceRepository
 from app.repositories.landlord_repository import LandlordRepository
-from app.repositories.tenant_repository import TenantRepository
-from app.repositories.webhook_repository import WebhookRepository
-from app.repositories.payment_processing_repository import (
-    PaymentProcessingRepository,
-)
 from app.repositories.ledger_repository import LedgerRepository
-from app.repositories.unassigned_payment_repository import (
-    UnassignedPaymentRepository,
-)
-from app.repositories.payment_transaction_repository import (
-    PaymentTransactionRepository,
+from app.repositories.outbox_event_repository import (
+    OutboxEventRepository,
 )
 from app.repositories.payment_allocation_repository import (
     PaymentAllocationRepository,
 )
-from app.repositories.invoice_repository import InvoiceRepository
 from app.repositories.payment_credit_repository import (
     PaymentCreditRepository,
 )
-from app.repositories.outbox_event_repository import (
-    OutboxEventRepository,
+from app.repositories.payment_processing_repository import (
+    PaymentProcessingRepository,
 )
+from app.repositories.payment_transaction_repository import (
+    PaymentTransactionRepository,
+)
+from app.repositories.tenant_repository import TenantRepository
+from app.repositories.unassigned_payment_repository import (
+    UnassignedPaymentRepository,
+)
+from app.repositories.webhook_repository import WebhookRepository
+
+# ============================================================
+# Services
+# ============================================================
 
 from app.services.idempotency_service import IdempotencyService
 from app.services.invoice_allocation_service import (
     InvoiceAllocationService,
 )
+from app.services.outbox_event_service import OutboxEventService
 from app.services.reconciliation_service import ReconciliationService
 from app.services.webhook_service import WebhookService
-from app.services.outbox_event_service import OutboxEventService
 
 
 # ============================================================
-# Repository dependencies
+# Repository Dependency Providers
 # ============================================================
+
 
 def get_landlord_repository(
     db: AsyncSession = Depends(get_db),
@@ -107,8 +118,9 @@ def get_outbox_event_repository(
 
 
 # ============================================================
-# Service dependencies
+# Service Dependency Providers
 # ============================================================
+
 
 def get_idempotency_service() -> IdempotencyService:
     return IdempotencyService()
@@ -160,6 +172,14 @@ def get_reconciliation_service(
         get_outbox_event_service
     ),
 ) -> ReconciliationService:
+    """
+    Build the reconciliation service.
+
+    Reconciliation owns the financial transaction, so the
+    OutboxEventService is injected here to ensure the
+    PAYMENT_PROCESSED event is created within the same
+    database transaction as the financial changes.
+    """
     return ReconciliationService(
         tenant_repository=tenant_repository,
         payment_transaction_repository=payment_transaction_repository,
@@ -187,6 +207,14 @@ def get_webhook_service(
         get_reconciliation_service
     ),
 ) -> WebhookService:
+    """
+    Build the webhook service.
+
+    WebhookService coordinates ingestion and delegates the
+    financial reconciliation work to ReconciliationService.
+    It intentionally does not receive OutboxEventService
+    directly.
+    """
     return WebhookService(
         webhook_repository=webhook_repository,
         landlord_repository=landlord_repository,

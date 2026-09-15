@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     POSTGRES_PORT: int = 5434
 
     DATABASE_URL: str
+    SYSTEM_DATABASE_URL: str
 
     # ============================================================
     # Redis

@@ -2102,3 +2102,486 @@ async def test_exact_payment_fully_allocates_invoice_without_payment_credit():
             await db.commit()
 
         raise
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_concurrent_different_payments_cannot_overallocate_same_invoice():
+    suffix = uuid4().hex[:12]
+
+    invoice_number = f"IT-CONCURRENT-INVOICE-{suffix}"
+
+    receipt_a = f"IT-CONCURRENT-A-{suffix}"
+    merchant_a = f"IT-CONCURRENT-MERCHANT-A-{suffix}"
+    checkout_a = f"IT-CONCURRENT-CHECKOUT-A-{suffix}"
+
+    receipt_b = f"IT-CONCURRENT-B-{suffix}"
+    merchant_b = f"IT-CONCURRENT-MERCHANT-B-{suffix}"
+    checkout_b = f"IT-CONCURRENT-CHECKOUT-B-{suffix}"
+
+    invoice_amount = 100
+    payment_amount = 70
+    expected_total_payment = 140
+    expected_allocation = 100
+    expected_credit = 40
+
+    invoice_id = None
+    transaction_ids = []
+
+    async with TestSystemSessionLocal() as db:
+        result = await db.execute(
+            text(
+                """
+                INSERT INTO invoices (
+                    landlord_id,
+                    unit_id,
+                    tenant_id,
+                    invoice_number,
+                    billing_month,
+                    rent_amount,
+                    water_amount,
+                    garbage_amount,
+                    security_amount,
+                    due_date,
+                    is_paid
+                )
+                VALUES (
+                    :landlord_id,
+                    :unit_id,
+                    :tenant_id,
+                    :invoice_number,
+                    CURRENT_DATE,
+                    :rent_amount,
+                    0,
+                    0,
+                    0,
+                    CURRENT_DATE,
+                    false
+                )
+                RETURNING id
+                """
+            ),
+            {
+                "landlord_id": LANDLORD_ID,
+                "unit_id": UNIT_ID,
+                "tenant_id": TENANT_ID,
+                "invoice_number": invoice_number,
+                "rent_amount": invoice_amount,
+            },
+        )
+
+        invoice_id = str(result.scalar_one())
+        await db.commit()
+
+    payload_a = callback_payload(
+        receipt_a,
+        merchant_a,
+        checkout_a,
+        payment_amount,
+    )
+
+    payload_b = callback_payload(
+        receipt_b,
+        merchant_b,
+        checkout_b,
+        payment_amount,
+    )
+
+    async def send_payment(payload):
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            return await client.post(
+                WEBHOOK_URL,
+                json=payload,
+            )
+
+    try:
+        response_a, response_b = await asyncio.gather(
+            send_payment(payload_a),
+            send_payment(payload_b),
+        )
+
+        assert response_a.status_code == 200
+        assert response_b.status_code == 200
+
+        body_a = response_a.json()
+        body_b = response_b.json()
+
+        assert body_a["ResultCode"] == 0
+        assert body_b["ResultCode"] == 0
+
+        assert body_a["reconciliation"]["status"] == "MATCHED"
+        assert body_b["reconciliation"]["status"] == "MATCHED"
+
+        transaction_id_a = body_a["reconciliation"]["payment_transaction_id"]
+        transaction_id_b = body_b["reconciliation"]["payment_transaction_id"]
+
+        transaction_ids = [transaction_id_a, transaction_id_b]
+
+        assert transaction_id_a != transaction_id_b
+
+        async with TestSystemSessionLocal() as db:
+            allocation_total = await db.scalar(
+                text(
+                    """
+                    SELECT COALESCE(SUM(amount), 0)
+                    FROM payment_allocations
+                    WHERE invoice_id = :invoice_id
+                      AND status = 'ALLOCATED'
+                    """
+                ),
+                {"invoice_id": invoice_id},
+            )
+
+            assert allocation_total == expected_allocation
+            assert allocation_total <= invoice_amount
+
+            credit_total = await db.scalar(
+                text(
+                    """
+                    SELECT COALESCE(SUM(amount), 0)
+                    FROM payment_credits
+                    WHERE payment_transaction_id IN (:transaction_id_a, :transaction_id_b)
+                    """
+                ),
+                {
+                    "transaction_id_a": transaction_id_a,
+                    "transaction_id_b": transaction_id_b,
+                },
+            )
+
+            assert credit_total == expected_credit
+
+            transaction_total = await db.scalar(
+                text(
+                    """
+                    SELECT COALESCE(SUM(amount), 0)
+                    FROM payment_transactions
+                    WHERE id IN (:transaction_id_a, :transaction_id_b)
+                    """
+                ),
+                {
+                    "transaction_id_a": transaction_id_a,
+                    "transaction_id_b": transaction_id_b,
+                },
+            )
+
+            assert transaction_total == expected_total_payment
+
+            invoice_paid = await db.scalar(
+                text(
+                    """
+                    SELECT is_paid
+                    FROM invoices
+                    WHERE id = :invoice_id
+                    """
+                ),
+                {"invoice_id": invoice_id},
+            )
+
+            assert invoice_paid is True
+
+            ledger_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM ledger_entries
+                    WHERE payment_transaction_id IN (
+                        :transaction_id_a,
+                        :transaction_id_b
+                    )
+                    """
+                ),
+                {
+                    "transaction_id_a": transaction_id_a,
+                    "transaction_id_b": transaction_id_b,
+                },
+            )
+
+            outbox_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM outbox_events
+                    WHERE aggregate_id IN (
+                        :transaction_id_a,
+                        :transaction_id_b
+                    )
+                    """
+                ),
+                {
+                    "transaction_id_a": transaction_id_a,
+                    "transaction_id_b": transaction_id_b,
+                },
+            )
+
+            assert ledger_count == 2
+            assert outbox_count == 2
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE aggregate_id IN (
+                        :transaction_id_a,
+                        :transaction_id_b
+                    )
+                    """
+                ),
+                {
+                    "transaction_id_a": transaction_id_a,
+                    "transaction_id_b": transaction_id_b,
+                },
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM ledger_entries
+                    WHERE payment_transaction_id IN (
+                        :transaction_id_a,
+                        :transaction_id_b
+                    )
+                    """
+                ),
+                {
+                    "transaction_id_a": transaction_id_a,
+                    "transaction_id_b": transaction_id_b,
+                },
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_credits
+                    WHERE payment_transaction_id IN (
+                        :transaction_id_a,
+                        :transaction_id_b
+                    )
+                    """
+                ),
+                {
+                    "transaction_id_a": transaction_id_a,
+                    "transaction_id_b": transaction_id_b,
+                },
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_allocations
+                    WHERE payment_transaction_id IN (
+                        :transaction_id_a,
+                        :transaction_id_b
+                    )
+                    """
+                ),
+                {
+                    "transaction_id_a": transaction_id_a,
+                    "transaction_id_b": transaction_id_b,
+                },
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_transactions
+                    WHERE id IN (
+                        :transaction_id_a,
+                        :transaction_id_b
+                    )
+                    """
+                ),
+                {
+                    "transaction_id_a": transaction_id_a,
+                    "transaction_id_b": transaction_id_b,
+                },
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_processing
+                    WHERE mpesa_receipt_number IN (
+                        :receipt_a,
+                        :receipt_b
+                    )
+                    """
+                ),
+                {
+                    "receipt_a": receipt_a,
+                    "receipt_b": receipt_b,
+                },
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM raw_payment_webhooks
+                    WHERE mpesa_receipt_number IN (
+                        :receipt_a,
+                        :receipt_b
+                    )
+                    """
+                ),
+                {
+                    "receipt_a": receipt_a,
+                    "receipt_b": receipt_b,
+                },
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM invoices
+                    WHERE id = :invoice_id
+                    """
+                ),
+                {"invoice_id": invoice_id},
+            )
+
+            await db.commit()
+
+    except Exception:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE aggregate_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number IN (
+                            :receipt_a,
+                            :receipt_b
+                        )
+                    )
+                    """
+                ),
+                {
+                    "receipt_a": receipt_a,
+                    "receipt_b": receipt_b,
+                },
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM ledger_entries
+                    WHERE payment_transaction_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number IN (
+                            :receipt_a,
+                            :receipt_b
+                        )
+                    )
+                    """
+                ),
+                {
+                    "receipt_a": receipt_a,
+                    "receipt_b": receipt_b,
+                },
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_credits
+                    WHERE payment_transaction_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number IN (
+                            :receipt_a,
+                            :receipt_b
+                        )
+                    )
+                    """
+                ),
+                {
+                    "receipt_a": receipt_a,
+                    "receipt_b": receipt_b,
+                },
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_allocations
+                    WHERE payment_transaction_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number IN (
+                            :receipt_a,
+                            :receipt_b
+                        )
+                    )
+                    """
+                ),
+                {
+                    "receipt_a": receipt_a,
+                    "receipt_b": receipt_b,
+                },
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_transactions
+                    WHERE mpesa_receipt_number IN (
+                        :receipt_a,
+                        :receipt_b
+                    )
+                    """
+                ),
+                {
+                    "receipt_a": receipt_a,
+                    "receipt_b": receipt_b,
+                },
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_processing
+                    WHERE mpesa_receipt_number IN (
+                        :receipt_a,
+                        :receipt_b
+                    )
+                    """
+                ),
+                {
+                    "receipt_a": receipt_a,
+                    "receipt_b": receipt_b,
+                },
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM raw_payment_webhooks
+                    WHERE mpesa_receipt_number IN (
+                        :receipt_a,
+                        :receipt_b
+                    )
+                    """
+                ),
+                {
+                    "receipt_a": receipt_a,
+                    "receipt_b": receipt_b,
+                },
+            )
+
+            if invoice_id:
+                await db.execute(
+                    text(
+                        """
+                        DELETE FROM invoices
+                        WHERE id = :invoice_id
+                        """
+                    ),
+                    {"invoice_id": invoice_id},
+                )
+
+            await db.commit()
+
+        raise

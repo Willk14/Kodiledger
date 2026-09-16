@@ -1744,3 +1744,361 @@ async def test_partial_payment_allocates_invoice_without_payment_credit():
             await db.commit()
 
         raise
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_exact_payment_fully_allocates_invoice_without_payment_credit():
+    suffix = uuid4().hex[:12]
+
+    receipt = f"IT-EXACT-{suffix}"
+    merchant = f"IT-EXACT-MERCHANT-{suffix}"
+    checkout = f"IT-EXACT-CHECKOUT-{suffix}"
+    invoice_number = f"IT-EXACT-INVOICE-{suffix}"
+
+    invoice_amount = 200
+    payment_amount = 200
+
+    invoice_id = None
+    transaction_id = None
+
+    async with TestSystemSessionLocal() as db:
+        result = await db.execute(
+            text(
+                """
+                INSERT INTO invoices (
+                    landlord_id,
+                    unit_id,
+                    tenant_id,
+                    invoice_number,
+                    billing_month,
+                    rent_amount,
+                    water_amount,
+                    garbage_amount,
+                    security_amount,
+                    due_date,
+                    is_paid
+                )
+                VALUES (
+                    :landlord_id,
+                    :unit_id,
+                    :tenant_id,
+                    :invoice_number,
+                    CURRENT_DATE,
+                    :rent_amount,
+                    0,
+                    0,
+                    0,
+                    CURRENT_DATE,
+                    false
+                )
+                RETURNING id
+                """
+            ),
+            {
+                "landlord_id": LANDLORD_ID,
+                "unit_id": UNIT_ID,
+                "tenant_id": TENANT_ID,
+                "invoice_number": invoice_number,
+                "rent_amount": invoice_amount,
+            },
+        )
+
+        invoice_id = str(result.scalar_one())
+        await db.commit()
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                WEBHOOK_URL,
+                json=callback_payload(
+                    receipt,
+                    merchant,
+                    checkout,
+                    payment_amount,
+                ),
+            )
+
+        assert response.status_code == 200
+
+        body = response.json()
+
+        assert body["ResultCode"] == 0
+        assert body["ResultDesc"] == "Webhook processed successfully"
+        assert body["reconciliation"]["status"] == "MATCHED"
+
+        transaction_id = body["reconciliation"]["payment_transaction_id"]
+
+        async with TestSystemSessionLocal() as db:
+            allocation_result = await db.execute(
+                text(
+                    """
+                    SELECT
+                        amount,
+                        status,
+                        invoice_id
+                    FROM payment_allocations
+                    WHERE payment_transaction_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            allocation = allocation_result.mappings().first()
+
+            assert allocation is not None
+            assert allocation["amount"] == payment_amount
+            assert str(allocation["status"]) == "ALLOCATED"
+            assert str(allocation["invoice_id"]) == invoice_id
+
+            invoice_paid = await db.scalar(
+                text(
+                    """
+                    SELECT is_paid
+                    FROM invoices
+                    WHERE id = :invoice_id
+                    """
+                ),
+                {"invoice_id": invoice_id},
+            )
+
+            assert invoice_paid is True
+
+            remaining_amount = await db.scalar(
+                text(
+                    """
+                    SELECT
+                        (
+                            rent_amount
+                            + water_amount
+                            + garbage_amount
+                            + security_amount
+                        ) - COALESCE(
+                            (
+                                SELECT SUM(pa.amount)
+                                FROM payment_allocations pa
+                                WHERE pa.invoice_id = invoices.id
+                                  AND pa.status = 'ALLOCATED'
+                            ),
+                            0
+                        )
+                    FROM invoices
+                    WHERE id = :invoice_id
+                    """
+                ),
+                {"invoice_id": invoice_id},
+            )
+
+            assert remaining_amount == 0
+
+            credit_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM payment_credits
+                    WHERE payment_transaction_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            assert credit_count == 0
+
+            transaction_amount = await db.scalar(
+                text(
+                    """
+                    SELECT amount
+                    FROM payment_transactions
+                    WHERE id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            assert transaction_amount == payment_amount
+
+            ledger_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM ledger_entries
+                    WHERE payment_transaction_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            outbox_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM outbox_events
+                    WHERE aggregate_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            assert ledger_count == 1
+            assert outbox_count == 1
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE aggregate_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM ledger_entries
+                    WHERE payment_transaction_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_allocations
+                    WHERE payment_transaction_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_transactions
+                    WHERE id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_processing
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM raw_payment_webhooks
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM invoices
+                    WHERE id = :invoice_id
+                    """
+                ),
+                {"invoice_id": invoice_id},
+            )
+
+            await db.commit()
+
+    except Exception:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE aggregate_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number = :receipt
+                    )
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM ledger_entries
+                    WHERE payment_transaction_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number = :receipt
+                    )
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_allocations
+                    WHERE payment_transaction_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number = :receipt
+                    )
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_transactions
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_processing
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM raw_payment_webhooks
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            if invoice_id:
+                await db.execute(
+                    text(
+                        """
+                        DELETE FROM invoices
+                        WHERE id = :invoice_id
+                        """
+                    ),
+                    {"invoice_id": invoice_id},
+                )
+
+            await db.commit()
+
+        raise

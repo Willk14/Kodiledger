@@ -539,3 +539,247 @@ async def test_successful_webhook_creates_unassigned_payment():
 async def close_test_engine():
     yield
     await test_system_engine.dispose()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_failed_webhook_is_audited_without_financial_processing():
+    suffix = uuid4().hex[:12]
+
+    receipt = f"IT-FAILED-{suffix}"
+    merchant = f"IT-FAILED-MERCHANT-{suffix}"
+    checkout = f"IT-FAILED-CHECKOUT-{suffix}"
+
+    # Non-zero ResultCode represents a failed STK request.
+    result_code = 1032
+    result_desc = "Request cancelled by user"
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            WEBHOOK_URL,
+            json={
+                "Body": {
+                    "stkCallback": {
+                        "MerchantRequestID": merchant,
+                        "CheckoutRequestID": checkout,
+                        "ResultCode": result_code,
+                        "ResultDesc": result_desc,
+                    }
+                }
+            },
+        )
+
+    assert response.status_code == 200
+
+    body = response.json()
+
+    # Failed callbacks are acknowledged successfully by the webhook.
+    assert body["ResultCode"] == 0
+    assert body["ResultDesc"] == "Webhook received successfully"
+
+    async with TestSystemSessionLocal() as db:
+        raw_result = await db.execute(
+            text(
+                """
+                SELECT
+                    id,
+                    result_code,
+                    result_description,
+                    processed
+                FROM raw_payment_webhooks
+                WHERE merchant_request_id = :merchant
+                  AND checkout_request_id = :checkout
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ),
+            {
+                "merchant": merchant,
+                "checkout": checkout,
+            },
+        )
+
+        raw_row = raw_result.mappings().first()
+
+        assert raw_row is not None
+        assert raw_row["result_code"] == result_code
+        assert raw_row["result_description"] == result_desc
+        assert raw_row["processed"] is True
+
+        processing_count = await db.scalar(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM payment_processing
+                WHERE mpesa_receipt_number = :receipt
+                """
+            ),
+            {"receipt": receipt},
+        )
+
+        transaction_count = await db.scalar(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM payment_transactions
+                WHERE mpesa_receipt_number = :receipt
+                """
+            ),
+            {"receipt": receipt},
+        )
+
+        assert processing_count == 0
+        assert transaction_count == 0
+
+        await db.execute(
+            text(
+                """
+                DELETE FROM raw_payment_webhooks
+                WHERE merchant_request_id = :merchant
+                  AND checkout_request_id = :checkout
+                """
+            ),
+            {
+                "merchant": merchant,
+                "checkout": checkout,
+            },
+        )
+
+        await db.commit()
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_failed_webhook_is_audited_without_financial_processing():
+    suffix = uuid4().hex[:12]
+
+    merchant = f"IT-FAILED-MERCHANT-{suffix}"
+    checkout = f"IT-FAILED-CHECKOUT-{suffix}"
+    receipt = f"IT-FAILED-{suffix}"
+
+    result_code = 1032
+    result_desc = "Request cancelled by user"
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                WEBHOOK_URL,
+                json={
+                    "Body": {
+                        "stkCallback": {
+                            "MerchantRequestID": merchant,
+                            "CheckoutRequestID": checkout,
+                            "ResultCode": result_code,
+                            "ResultDesc": result_desc,
+                        }
+                    }
+                },
+            )
+
+        assert response.status_code == 200
+
+        body = response.json()
+
+        # The webhook endpoint acknowledges receipt of the failed callback.
+        assert body["ResultCode"] == 0
+
+        async with TestSystemSessionLocal() as db:
+            raw_result = await db.execute(
+                text(
+                    """
+                    SELECT
+                        id,
+                        merchant_request_id,
+                        checkout_request_id,
+                        mpesa_receipt_number,
+                        raw_payload,
+                        processed,
+                        error_log
+                    FROM raw_payment_webhooks
+                    WHERE merchant_request_id = :merchant
+                      AND checkout_request_id = :checkout
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """
+                ),
+                {
+                    "merchant": merchant,
+                    "checkout": checkout,
+                },
+            )
+
+            raw_row = raw_result.mappings().first()
+
+            assert raw_row is not None
+            assert raw_row["merchant_request_id"] == merchant
+            assert raw_row["checkout_request_id"] == checkout
+            assert raw_row["processed"] is True
+
+            # Failed callbacks do not contain successful-payment metadata.
+            assert raw_row["mpesa_receipt_number"] is None
+
+            raw_payload = raw_row["raw_payload"]
+
+            assert raw_payload["Body"]["stkCallback"]["ResultCode"] == result_code
+            assert (
+                raw_payload["Body"]["stkCallback"]["ResultDesc"]
+                == result_desc
+            )
+
+            processing_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM payment_processing
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            transaction_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM payment_transactions
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            assert processing_count == 0
+            assert transaction_count == 0
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM raw_payment_webhooks
+                    WHERE merchant_request_id = :merchant
+                      AND checkout_request_id = :checkout
+                    """
+                ),
+                {
+                    "merchant": merchant,
+                    "checkout": checkout,
+                },
+            )
+
+            await db.commit()
+
+    except Exception:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM raw_payment_webhooks
+                    WHERE merchant_request_id = :merchant
+                      AND checkout_request_id = :checkout
+                    """
+                ),
+                {
+                    "merchant": merchant,
+                    "checkout": checkout,
+                },
+            )
+            await db.commit()
+        raise

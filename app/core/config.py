@@ -75,6 +75,9 @@ class Settings(BaseSettings):
         case_sensitive=True,
     )
 
+    KAFKA_BOOTSTRAP_SERVERS: str = "127.0.0.1:9092"
+    KAFKA_PAYMENT_TOPIC: str = "payment.processed"
+
 
 settings = Settings()
 

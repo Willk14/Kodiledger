@@ -4,7 +4,7 @@ import asyncio
 import logging
 
 from app.core.database import SystemSessionLocal
-from app.integrations.events.logging_publisher import LoggingEventPublisher
+from app.integrations.events.kafka_publisher import KafkaEventPublisher
 from app.services.outbox_worker import OutboxWorker
 
 
@@ -17,7 +17,9 @@ logger = logging.getLogger(__name__)
 
 
 async def run_forever() -> None:
-    publisher = LoggingEventPublisher()
+    publisher = KafkaEventPublisher()
+
+    await publisher.start()
 
     worker = OutboxWorker(
         SystemSessionLocal,
@@ -33,23 +35,28 @@ async def run_forever() -> None:
         MAX_ATTEMPTS,
     )
 
-    while True:
-        try:
-            processed = await worker.run_once()
+    try:
+        while True:
+            try:
+                processed = await worker.run_once()
 
-            if processed:
-                logger.info(
-                    "Outbox worker processed %s event(s)",
-                    processed,
-                )
+                if processed:
+                    logger.info(
+                        "Outbox worker processed %s event(s)",
+                        processed,
+                    )
 
-        except asyncio.CancelledError:
-            raise
+            except asyncio.CancelledError:
+                raise
 
-        except Exception:
-            logger.exception("Outbox worker iteration failed")
+            except Exception:
+                logger.exception("Outbox worker iteration failed")
 
-        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+            await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+    finally:
+        await publisher.stop()
+        logger.info("Kafka publisher stopped")
 
 
 def main() -> None:

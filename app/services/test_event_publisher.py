@@ -4,6 +4,7 @@ from typing import Any
 
 
 class TestEventPublisher:
+    __test__ = False
     def __init__(self) -> None:
         self.published_events: list[dict[str, Any]] = []
         self.fail = False

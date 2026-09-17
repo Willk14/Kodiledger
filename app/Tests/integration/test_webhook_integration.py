@@ -8,6 +8,8 @@ import httpx
 import pytest
 from sqlalchemy import text
 from app.repositories.outbox_event_repository import OutboxEventRepository
+from app.services.outbox_worker import OutboxWorker
+from app.services.test_event_publisher import TestEventPublisher
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -2917,6 +2919,317 @@ async def test_outbox_claim_pending_prevents_two_workers_claiming_same_event():
         await db_a.close()
         await db_b.close()
 
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE id = :event_id
+                    """
+                ),
+                {"event_id": event_id},
+            )
+            await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_outbox_worker_publishes_pending_event():
+    event_id = None
+    idempotency_key = f"IT-OUTBOX-WORKER-SUCCESS-{uuid4().hex}"
+
+    async with TestSystemSessionLocal() as db:
+        result = await db.execute(
+            text(
+                """
+                INSERT INTO outbox_events (
+                    event_type,
+                    aggregate_type,
+                    aggregate_id,
+                    idempotency_key,
+                    payload,
+                    status,
+                    available_at
+                )
+                VALUES (
+                    'TEST_EVENT',
+                    'TEST_AGGREGATE',
+                    gen_random_uuid(),
+                    :idempotency_key,
+                    '{"test": true}'::jsonb,
+                    'PENDING',
+                    CURRENT_TIMESTAMP
+                )
+                RETURNING id
+                """
+            ),
+            {"idempotency_key": idempotency_key},
+        )
+
+        event_id = result.scalar_one()
+        await db.commit()
+
+    try:
+        publisher = TestEventPublisher()
+
+        worker = OutboxWorker(
+            TestSystemSessionLocal,
+            publisher,
+            batch_size=100,
+        )
+
+        processed = await worker.run_once()
+
+        assert processed >= 1
+
+        published_event = next(
+            (
+                event
+                for event in publisher.published_events
+                if event["id"] == event_id
+            ),
+            None,
+        )
+
+        assert published_event is not None
+
+        async with TestSystemSessionLocal() as db:
+            row = (
+                await db.execute(
+                    text(
+                        """
+                        SELECT
+                            status,
+                            published_at,
+                            attempts,
+                            last_error,
+                            locked_at
+                        FROM outbox_events
+                        WHERE id = :event_id
+                        """
+                    ),
+                    {"event_id": event_id},
+                )
+            ).mappings().first()
+
+            assert row is not None
+            assert row["status"] == "PUBLISHED"
+            assert row["published_at"] is not None
+            assert row["attempts"] == 0
+            assert row["last_error"] is None
+            assert row["locked_at"] is None
+
+    finally:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE id = :event_id
+                    """
+                ),
+                {"event_id": event_id},
+            )
+            await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_outbox_worker_schedules_retry_after_publish_failure():
+    event_id = None
+    idempotency_key = f"IT-OUTBOX-WORKER-RETRY-{uuid4().hex}"
+
+    async with TestSystemSessionLocal() as db:
+        result = await db.execute(
+            text(
+                """
+                INSERT INTO outbox_events (
+                    event_type,
+                    aggregate_type,
+                    aggregate_id,
+                    idempotency_key,
+                    payload,
+                    status,
+                    available_at
+                )
+                VALUES (
+                    'TEST_EVENT',
+                    'TEST_AGGREGATE',
+                    gen_random_uuid(),
+                    :idempotency_key,
+                    '{"test": true}'::jsonb,
+                    'PENDING',
+                    CURRENT_TIMESTAMP
+                )
+                RETURNING id
+                """
+            ),
+            {"idempotency_key": idempotency_key},
+        )
+
+        event_id = result.scalar_one()
+        before = await db.scalar(
+            text(
+                """
+                SELECT available_at
+                FROM outbox_events
+                WHERE id = :event_id
+                """
+            ),
+            {"event_id": event_id},
+        )
+        await db.commit()
+
+    try:
+        publisher = TestEventPublisher()
+        publisher.fail = True
+
+        worker = OutboxWorker(
+            TestSystemSessionLocal,
+            publisher,
+            batch_size=100,
+        )
+
+        processed = await worker.run_once()
+
+        assert processed == 0
+
+        async with TestSystemSessionLocal() as db:
+            row = (
+                await db.execute(
+                    text(
+                        """
+                        SELECT
+                            status,
+                            attempts,
+                            available_at,
+                            last_error,
+                            locked_at
+                        FROM outbox_events
+                        WHERE id = :event_id
+                        """
+                    ),
+                    {"event_id": event_id},
+                )
+            ).mappings().first()
+
+            assert row is not None
+            assert row["status"] == "PENDING"
+            assert row["attempts"] == 1
+            assert row["available_at"] > before
+            assert row["last_error"] == "Simulated publisher failure"
+            assert row["locked_at"] is None
+
+    finally:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE id = :event_id
+                    """
+                ),
+                {"event_id": event_id},
+            )
+            await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_outbox_worker_marks_event_failed_after_max_attempts():
+    event_id = None
+    idempotency_key = f"IT-OUTBOX-WORKER-FAILED-{uuid4().hex}"
+
+    async with TestSystemSessionLocal() as db:
+        result = await db.execute(
+            text(
+                """
+                INSERT INTO outbox_events (
+                    event_type,
+                    aggregate_type,
+                    aggregate_id,
+                    idempotency_key,
+                    payload,
+                    status,
+                    attempts,
+                    available_at
+                )
+                VALUES (
+                    'TEST_EVENT',
+                    'TEST_AGGREGATE',
+                    gen_random_uuid(),
+                    :idempotency_key,
+                    '{"test": true}'::jsonb,
+                    'PENDING',
+                    1,
+                    CURRENT_TIMESTAMP
+                )
+                RETURNING id
+                """
+            ),
+            {"idempotency_key": idempotency_key},
+        )
+
+        event_id = result.scalar_one()
+        await db.commit()
+
+    try:
+        publisher = TestEventPublisher()
+        publisher.fail = True
+
+        worker = OutboxWorker(
+            TestSystemSessionLocal,
+            publisher,
+            batch_size=100,
+            max_attempts=2,
+        )
+
+        first_result = await worker.run_once()
+
+        assert first_result == 0
+
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    UPDATE outbox_events
+                    SET available_at = CURRENT_TIMESTAMP
+                    WHERE id = :event_id
+                    """
+                ),
+                {"event_id": event_id},
+            )
+            await db.commit()
+
+        second_result = await worker.run_once()
+
+        assert second_result == 0
+
+        async with TestSystemSessionLocal() as db:
+            row = (
+                await db.execute(
+                    text(
+                        """
+                        SELECT
+                            status,
+                            attempts,
+                            last_error,
+                            locked_at
+                        FROM outbox_events
+                        WHERE id = :event_id
+                        """
+                    ),
+                    {"event_id": event_id},
+                )
+            ).mappings().first()
+
+            assert row is not None
+            assert row["status"] == "FAILED"
+            assert row["attempts"] == 2
+            assert row["last_error"] == "Simulated publisher failure"
+            assert row["locked_at"] is None
+
+    finally:
         async with TestSystemSessionLocal() as db:
             await db.execute(
                 text(

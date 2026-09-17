@@ -3241,3 +3241,107 @@ async def test_outbox_worker_marks_event_failed_after_max_attempts():
                 {"event_id": event_id},
             )
             await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_outbox_worker_reclaims_stale_locked_event():
+    event_id = None
+    idempotency_key = f"IT-OUTBOX-STALE-LOCK-{uuid4().hex}"
+
+    async with TestSystemSessionLocal() as db:
+        result = await db.execute(
+            text(
+                """
+                INSERT INTO outbox_events (
+                    event_type,
+                    aggregate_type,
+                    aggregate_id,
+                    idempotency_key,
+                    payload,
+                    status,
+                    attempts,
+                    available_at,
+                    locked_at
+                )
+                VALUES (
+                    'TEST_EVENT',
+                    'TEST_AGGREGATE',
+                    gen_random_uuid(),
+                    :idempotency_key,
+                    '{"test": true}'::jsonb,
+                    'PENDING',
+                    0,
+                    CURRENT_TIMESTAMP,
+                    CURRENT_TIMESTAMP - INTERVAL '10 minutes'
+                )
+                RETURNING id
+                """
+            ),
+            {"idempotency_key": idempotency_key},
+        )
+
+        event_id = result.scalar_one()
+        await db.commit()
+
+    try:
+        publisher = TestEventPublisher()
+
+        worker = OutboxWorker(
+            TestSystemSessionLocal,
+            publisher,
+            batch_size=100,
+            max_attempts=5,
+        )
+
+        processed = await worker.run_once()
+
+        assert processed >= 1
+
+        published_event = next(
+            (
+                event
+                for event in publisher.published_events
+                if event["id"] == event_id
+            ),
+            None,
+        )
+
+        assert published_event is not None
+
+        async with TestSystemSessionLocal() as db:
+            row = (
+                await db.execute(
+                    text(
+                        """
+                        SELECT
+                            status,
+                            attempts,
+                            published_at,
+                            locked_at
+                        FROM outbox_events
+                        WHERE id = :event_id
+                        """
+                    ),
+                    {"event_id": event_id},
+                )
+            ).mappings().first()
+
+            assert row is not None
+            assert row["status"] == "PUBLISHED"
+            assert row["attempts"] == 0
+            assert row["published_at"] is not None
+            assert row["locked_at"] is None
+
+    finally:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE id = :event_id
+                    """
+                ),
+                {"event_id": event_id},
+            )
+            await db.commit()

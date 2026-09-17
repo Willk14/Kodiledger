@@ -7,6 +7,7 @@ from uuid import uuid4
 import httpx
 import pytest
 from sqlalchemy import text
+from app.repositories.outbox_event_repository import OutboxEventRepository
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -2585,3 +2586,345 @@ async def test_concurrent_different_payments_cannot_overallocate_same_invoice():
             await db.commit()
 
         raise
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_outbox_claim_pending_locks_and_returns_event():
+    event_id = None
+    idempotency_key = f"IT-OUTBOX-CLAIM-{uuid4().hex}"
+
+    async with TestSystemSessionLocal() as db:
+        result = await db.execute(
+            text(
+                """
+                INSERT INTO outbox_events (
+                    event_type,
+                    aggregate_type,
+                    aggregate_id,
+                    idempotency_key,
+                    payload,
+                    status,
+                    available_at
+                )
+                VALUES (
+                    'TEST_EVENT',
+                    'TEST_AGGREGATE',
+                    gen_random_uuid(),
+                    :idempotency_key,
+                    '{"test": true}'::jsonb,
+                    'PENDING',
+                    CURRENT_TIMESTAMP
+                )
+                RETURNING id
+                """
+            ),
+            {"idempotency_key": idempotency_key},
+        )
+
+        event_id = result.scalar_one()
+        await db.commit()
+
+    try:
+        async with TestSystemSessionLocal() as db:
+            repository = OutboxEventRepository(db)
+
+            events = await repository.claim_pending(limit=10)
+
+            claimed = next(
+                (
+                    event
+                    for event in events
+                    if event["id"] == event_id
+                ),
+                None,
+            )
+
+            assert claimed is not None
+            assert claimed["status"] == "PENDING"
+            assert claimed["locked_at"] is not None
+
+            await db.rollback()
+
+    finally:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE id = :event_id
+                    """
+                ),
+                {"event_id": event_id},
+            )
+            await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_outbox_schedule_retry_updates_attempts_and_available_at():
+    event_id = None
+    idempotency_key = f"IT-OUTBOX-RETRY-{uuid4().hex}"
+
+    async with TestSystemSessionLocal() as db:
+        result = await db.execute(
+            text(
+                """
+                INSERT INTO outbox_events (
+                    event_type,
+                    aggregate_type,
+                    aggregate_id,
+                    idempotency_key,
+                    payload,
+                    status,
+                    attempts,
+                    available_at,
+                    locked_at
+                )
+                VALUES (
+                    'TEST_EVENT',
+                    'TEST_AGGREGATE',
+                    gen_random_uuid(),
+                    :idempotency_key,
+                    '{"test": true}'::jsonb,
+                    'PENDING',
+                    0,
+                    CURRENT_TIMESTAMP,
+                    CURRENT_TIMESTAMP
+                )
+                RETURNING id
+                """
+            ),
+            {"idempotency_key": idempotency_key},
+        )
+
+        event_id = result.scalar_one()
+        await db.commit()
+
+    try:
+        async with TestSystemSessionLocal() as db:
+            repository = OutboxEventRepository(db)
+
+            before = await db.scalar(
+                text(
+                    """
+                    SELECT available_at
+                    FROM outbox_events
+                    WHERE id = :event_id
+                    """
+                ),
+                {"event_id": event_id},
+            )
+
+            await repository.schedule_retry(
+                event_id=event_id,
+                error="simulated publisher failure",
+                delay_seconds=60,
+            )
+
+            await db.commit()
+
+            row = (
+                await db.execute(
+                    text(
+                        """
+                        SELECT
+                            status,
+                            attempts,
+                            available_at,
+                            last_error,
+                            locked_at
+                        FROM outbox_events
+                        WHERE id = :event_id
+                        """
+                    ),
+                    {"event_id": event_id},
+                )
+            ).mappings().first()
+
+            assert row is not None
+            assert row["status"] == "PENDING"
+            assert row["attempts"] == 1
+            assert row["last_error"] == "simulated publisher failure"
+            assert row["locked_at"] is None
+            assert row["available_at"] > before
+
+    finally:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE id = :event_id
+                    """
+                ),
+                {"event_id": event_id},
+            )
+            await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_outbox_mark_published_sets_published_state():
+    event_id = None
+    idempotency_key = f"IT-OUTBOX-PUBLISHED-{uuid4().hex}"
+
+    async with TestSystemSessionLocal() as db:
+        result = await db.execute(
+            text(
+                """
+                INSERT INTO outbox_events (
+                    event_type,
+                    aggregate_type,
+                    aggregate_id,
+                    idempotency_key,
+                    payload,
+                    status,
+                    locked_at
+                )
+                VALUES (
+                    'TEST_EVENT',
+                    'TEST_AGGREGATE',
+                    gen_random_uuid(),
+                    :idempotency_key,
+                    '{"test": true}'::jsonb,
+                    'PENDING',
+                    CURRENT_TIMESTAMP
+                )
+                RETURNING id
+                """
+            ),
+            {"idempotency_key": idempotency_key},
+        )
+
+        event_id = result.scalar_one()
+        await db.commit()
+
+    try:
+        async with TestSystemSessionLocal() as db:
+            repository = OutboxEventRepository(db)
+
+            await repository.mark_published(
+                event_id=event_id,
+            )
+
+            await db.commit()
+
+            row = (
+                await db.execute(
+                    text(
+                        """
+                        SELECT
+                            status,
+                            published_at,
+                            last_error,
+                            locked_at
+                        FROM outbox_events
+                        WHERE id = :event_id
+                        """
+                    ),
+                    {"event_id": event_id},
+                )
+            ).mappings().first()
+
+            assert row is not None
+            assert row["status"] == "PUBLISHED"
+            assert row["published_at"] is not None
+            assert row["last_error"] is None
+            assert row["locked_at"] is None
+
+    finally:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE id = :event_id
+                    """
+                ),
+                {"event_id": event_id},
+            )
+            await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_outbox_claim_pending_prevents_two_workers_claiming_same_event():
+    event_id = None
+    idempotency_key = f"IT-OUTBOX-CONCURRENT-CLAIM-{uuid4().hex}"
+
+    async with TestSystemSessionLocal() as db:
+        result = await db.execute(
+            text(
+                """
+                INSERT INTO outbox_events (
+                    event_type,
+                    aggregate_type,
+                    aggregate_id,
+                    idempotency_key,
+                    payload,
+                    status,
+                    available_at
+                )
+                VALUES (
+                    'TEST_EVENT',
+                    'TEST_AGGREGATE',
+                    gen_random_uuid(),
+                    :idempotency_key,
+                    '{"test": true}'::jsonb,
+                    'PENDING',
+                    CURRENT_TIMESTAMP
+                )
+                RETURNING id
+                """
+            ),
+            {"idempotency_key": idempotency_key},
+        )
+
+        event_id = result.scalar_one()
+        await db.commit()
+
+    db_a = TestSystemSessionLocal()
+    db_b = TestSystemSessionLocal()
+
+    try:
+        repository_a = OutboxEventRepository(db_a)
+        repository_b = OutboxEventRepository(db_b)
+
+        claimed_a, claimed_b = await asyncio.gather(
+            repository_a.claim_pending(limit=100),
+            repository_b.claim_pending(limit=100),
+        )
+
+        events_a = [
+            event
+            for event in claimed_a
+            if event["id"] == event_id
+        ]
+
+        events_b = [
+            event
+            for event in claimed_b
+            if event["id"] == event_id
+        ]
+
+        assert len(events_a) + len(events_b) == 1
+
+        await db_a.commit()
+        await db_b.commit()
+
+    finally:
+        await db_a.close()
+        await db_b.close()
+
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE id = :event_id
+                    """
+                ),
+                {"event_id": event_id},
+            )
+            await db.commit()

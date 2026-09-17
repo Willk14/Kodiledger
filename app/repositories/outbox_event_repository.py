@@ -51,7 +51,8 @@ class OutboxEventRepository:
                 available_at,
                 published_at,
                 last_error,
-                created_at
+                created_at,
+                locked_at
             """
         )
 
@@ -85,7 +86,8 @@ class OutboxEventRepository:
                 available_at,
                 published_at,
                 last_error,
-                created_at
+                created_at,
+                locked_at
             FROM outbox_events
             WHERE idempotency_key = :idempotency_key
             """
@@ -105,31 +107,44 @@ class OutboxEventRepository:
 
         return dict(existing_row)
 
-    async def get_pending(
+    async def claim_pending(
         self,
         *,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         query = text(
             """
-            SELECT
-                id,
-                event_type,
-                aggregate_type,
-                aggregate_id,
-                idempotency_key,
-                payload,
-                status,
-                attempts,
-                available_at,
-                published_at,
-                last_error,
-                created_at
-            FROM outbox_events
-            WHERE status = 'PENDING'
-              AND available_at <= CURRENT_TIMESTAMP
-            ORDER BY created_at
-            LIMIT :limit
+            WITH candidates AS (
+                SELECT id
+                FROM outbox_events
+                WHERE status = 'PENDING'
+                  AND available_at <= CURRENT_TIMESTAMP
+                  AND (
+                      locked_at IS NULL
+                      OR locked_at < CURRENT_TIMESTAMP - INTERVAL '5 minutes'
+                  )
+                ORDER BY created_at
+                FOR UPDATE SKIP LOCKED
+                LIMIT :limit
+            )
+            UPDATE outbox_events AS events
+            SET locked_at = CURRENT_TIMESTAMP
+            FROM candidates
+            WHERE events.id = candidates.id
+            RETURNING
+                events.id,
+                events.event_type,
+                events.aggregate_type,
+                events.aggregate_id,
+                events.idempotency_key,
+                events.payload,
+                events.status,
+                events.attempts,
+                events.available_at,
+                events.published_at,
+                events.last_error,
+                events.created_at,
+                events.locked_at
             """
         )
 
@@ -151,7 +166,8 @@ class OutboxEventRepository:
             SET
                 status = 'PUBLISHED',
                 published_at = CURRENT_TIMESTAMP,
-                last_error = NULL
+                last_error = NULL,
+                locked_at = NULL
             WHERE id = :event_id
             """
         )
@@ -159,6 +175,36 @@ class OutboxEventRepository:
         await self.db.execute(
             query,
             {"event_id": event_id},
+        )
+
+    async def schedule_retry(
+        self,
+        *,
+        event_id: UUID,
+        error: str,
+        delay_seconds: int,
+    ) -> None:
+        query = text(
+            """
+            UPDATE outbox_events
+            SET
+                status = 'PENDING',
+                attempts = attempts + 1,
+                available_at = CURRENT_TIMESTAMP
+                    + (:delay_seconds * INTERVAL '1 second'),
+                last_error = :error,
+                locked_at = NULL
+            WHERE id = :event_id
+            """
+        )
+
+        await self.db.execute(
+            query,
+            {
+                "event_id": event_id,
+                "error": error,
+                "delay_seconds": delay_seconds,
+            },
         )
 
     async def mark_failed(
@@ -173,7 +219,8 @@ class OutboxEventRepository:
             SET
                 status = 'FAILED',
                 attempts = attempts + 1,
-                last_error = :error
+                last_error = :error,
+                locked_at = NULL
             WHERE id = :event_id
             """
         )

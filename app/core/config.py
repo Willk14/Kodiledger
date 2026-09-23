@@ -38,6 +38,9 @@ class Settings(BaseSettings):
 
     REDIS_URL: str
 
+    RATE_LIMIT_STK_PUSH_REQUESTS: int = 5
+    RATE_LIMIT_STK_PUSH_WINDOW_SECONDS: int = 60
+
     # ============================================================
     # M-Pesa Daraja
     # ============================================================

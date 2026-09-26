@@ -1,12 +1,16 @@
 from decimal import Decimal
 from typing import Any
 
+from sqlalchemy import text
+
 from app.core.config import settings
+
 from app.repositories.landlord_repository import LandlordRepository
 from app.repositories.payment_processing_repository import (
     PaymentProcessingRepository,
 )
 from app.repositories.webhook_repository import WebhookRepository
+
 from app.services.idempotency_service import IdempotencyService
 from app.services.reconciliation_service import ReconciliationService
 
@@ -46,9 +50,7 @@ class WebhookService:
     ) -> None:
         self.webhook_repository = webhook_repository
         self.landlord_repository = landlord_repository
-        self.payment_processing_repository = (
-            payment_processing_repository
-        )
+        self.payment_processing_repository = payment_processing_repository
         self.idempotency_service = idempotency_service
         self.reconciliation_service = reconciliation_service
 
@@ -68,6 +70,28 @@ class WebhookService:
         redis_token: str | None = None
 
         try:
+            # ====================================================
+            # TEMPORARY DATABASE IDENTITY DIAGNOSTIC
+            # ====================================================
+
+            db_identity = await db.execute(
+                text(
+                    """
+                    SELECT
+                        current_database(),
+                        current_user,
+                        current_schema(),
+                        inet_server_addr(),
+                        inet_server_port()
+                    """
+                )
+            )
+
+            print(
+                "WEBHOOK DB IDENTITY:",
+                db_identity.fetchone(),
+            )
+
             # ====================================================
             # 1. Extract callback data
             # ====================================================
@@ -187,6 +211,7 @@ class WebhookService:
 
                 # Redis lock is stale, but PostgreSQL has
                 # never processed this payment.
+
                 lock_acquired = True
 
             # ====================================================
@@ -256,6 +281,7 @@ class WebhookService:
 
             # The payment completed successfully.
             # Keep the Redis lock until the TTL expires.
+
             redis_receipt = None
             redis_token = None
 

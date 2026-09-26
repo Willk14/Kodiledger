@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, status
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_system_db
@@ -25,9 +26,7 @@ async def receive_mpesa_webhook(
     The endpoint is responsible only for HTTP transport
     and dependency injection.
     """
-
     return await service.process_mpesa_callback(
         payload=payload,
         db=db,
     )
-    

@@ -74,24 +74,6 @@ class WebhookService:
             # TEMPORARY DATABASE IDENTITY DIAGNOSTIC
             # ====================================================
 
-            db_identity = await db.execute(
-                text(
-                    """
-                    SELECT
-                        current_database(),
-                        current_user,
-                        current_schema(),
-                        inet_server_addr(),
-                        inet_server_port()
-                    """
-                )
-            )
-
-            print(
-                "WEBHOOK DB IDENTITY:",
-                db_identity.fetchone(),
-            )
-
             # ====================================================
             # 1. Extract callback data
             # ====================================================

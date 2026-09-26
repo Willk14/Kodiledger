@@ -40,8 +40,9 @@ async def test_kafka_publisher() -> None:
         await publisher.publish(event)
 
         received = None
+        deadline = asyncio.get_running_loop().time() + 20
 
-        for _ in range(20):
+        while asyncio.get_running_loop().time() < deadline:
             try:
                 message = await asyncio.wait_for(
                     consumer.getone(),
@@ -64,3 +65,5 @@ async def test_kafka_publisher() -> None:
     finally:
         await publisher.stop()
         await consumer.stop()
+
+        

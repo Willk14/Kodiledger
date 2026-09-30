@@ -72,6 +72,10 @@ class OutboxEvent(Base):
         nullable=True,
     )
 
+    locked_at: Mapped[datetime | None] = mapped_column(
+        nullable=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         nullable=False,
         server_default=text("CURRENT_TIMESTAMP"),

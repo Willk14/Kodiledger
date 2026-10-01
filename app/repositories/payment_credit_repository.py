@@ -1,7 +1,8 @@
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -19,37 +20,28 @@ class PaymentCreditRepository:
         amount: Decimal,
         status: str = "AVAILABLE",
     ) -> dict[str, Any]:
+        from app.models.payment_credit import PaymentCredit
+
+        stmt = (
+            insert(PaymentCredit)
+            .values(
+                payment_transaction_id=payment_transaction_id,
+                tenant_id=tenant_id,
+                amount=amount,
+                status=status,
+            )
+            .returning(
+                PaymentCredit.id,
+                PaymentCredit.payment_transaction_id,
+                PaymentCredit.tenant_id,
+                PaymentCredit.amount,
+                PaymentCredit.status,
+                PaymentCredit.created_at,
+                PaymentCredit.applied_at,
+            )
+        )
         result = await self.db.execute(
-            text(
-                """
-                INSERT INTO payment_credits (
-                    payment_transaction_id,
-                    tenant_id,
-                    amount,
-                    status
-                )
-                VALUES (
-                    :payment_transaction_id,
-                    :tenant_id,
-                    :amount,
-                    :status
-                )
-                RETURNING
-                    id,
-                    payment_transaction_id,
-                    tenant_id,
-                    amount,
-                    status,
-                    created_at,
-                    applied_at
-                """
-            ),
-            {
-                "payment_transaction_id": payment_transaction_id,
-                "tenant_id": tenant_id,
-                "amount": amount,
-                "status": status,
-            },
+            stmt
         )
 
         row = result.mappings().first()
@@ -64,24 +56,23 @@ class PaymentCreditRepository:
         *,
         tenant_id: str,
     ) -> list[dict[str, Any]]:
+        from app.models.payment_credit import PaymentCredit
+
         result = await self.db.execute(
-            text(
-                """
-                SELECT
-                    id,
-                    payment_transaction_id,
-                    tenant_id,
-                    amount,
-                    status,
-                    created_at,
-                    applied_at
-                FROM payment_credits
-                WHERE tenant_id = :tenant_id
-                  AND status = 'AVAILABLE'
-                ORDER BY created_at ASC
-                """
-            ),
-            {"tenant_id": tenant_id},
+            select(
+                PaymentCredit.id,
+                PaymentCredit.payment_transaction_id,
+                PaymentCredit.tenant_id,
+                PaymentCredit.amount,
+                PaymentCredit.status,
+                PaymentCredit.created_at,
+                PaymentCredit.applied_at,
+            )
+            .where(
+                PaymentCredit.tenant_id == tenant_id,
+                PaymentCredit.status == "AVAILABLE",
+            )
+            .order_by(PaymentCredit.created_at.asc())
         )
 
         return [dict(row) for row in result.mappings().all()]
@@ -91,25 +82,23 @@ class PaymentCreditRepository:
         *,
         payment_transaction_id: str,
     ) -> dict[str, Any] | None:
+        from app.models.payment_credit import PaymentCredit
+
         result = await self.db.execute(
-            text(
-                """
-                SELECT
-                    id,
-                    payment_transaction_id,
-                    tenant_id,
-                    amount,
-                    status,
-                    created_at,
-                    applied_at
-                FROM payment_credits
-                WHERE payment_transaction_id = :payment_transaction_id
-                LIMIT 1
-                """
-            ),
-            {
-                "payment_transaction_id": payment_transaction_id,
-            },
+            select(
+                PaymentCredit.id,
+                PaymentCredit.payment_transaction_id,
+                PaymentCredit.tenant_id,
+                PaymentCredit.amount,
+                PaymentCredit.status,
+                PaymentCredit.created_at,
+                PaymentCredit.applied_at,
+            )
+            .where(
+                PaymentCredit.payment_transaction_id
+                == payment_transaction_id,
+            )
+            .limit(1)
         )
 
         row = result.mappings().first()

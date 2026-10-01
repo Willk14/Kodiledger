@@ -68,6 +68,11 @@ class PaymentProcessing(Base):
         server_default="CURRENT_TIMESTAMP",
     )
 
+    processed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
     raw_webhook: Mapped["RawPaymentWebhook"] = relationship(
         "RawPaymentWebhook",
         back_populates="payment_processing_records",

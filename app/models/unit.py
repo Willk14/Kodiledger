@@ -3,9 +3,10 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
+from app.models.ledger_entry import LedgerEntry
 from uuid import UUID
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Numeric, String, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Numeric, String
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -18,20 +19,10 @@ if TYPE_CHECKING:
     from app.models.property import Property
     from app.models.tenant import Tenant
     from app.models.utility_reading import UtilityReading
-    from app.models.unassigned_payment import UnassignedPayment
 
 
 class Unit(Base):
     __tablename__ = "units"
-
-    __table_args__ = (
-        CheckConstraint("base_rent >= 0"),
-        CheckConstraint("garbage_fee >= 0"),
-        CheckConstraint("security_fee >= 0"),
-        UniqueConstraint("property_id", "unit_number"),
-        Index("idx_units_landlord", "landlord_id"),
-        Index("idx_units_property", "property_id"),
-    )
 
     id: Mapped[UUID] = mapped_column(
         PG_UUID(as_uuid=True),
@@ -61,27 +52,31 @@ class Unit(Base):
         nullable=False,
     )
 
-    garbage_fee: Mapped[Decimal | None] = mapped_column(
+    garbage_fee: Mapped[Decimal] = mapped_column(
         Numeric(10, 2),
+        nullable=False,
         server_default="0.00",
     )
 
-    security_fee: Mapped[Decimal | None] = mapped_column(
+    security_fee: Mapped[Decimal] = mapped_column(
         Numeric(10, 2),
+        nullable=False,
         server_default="0.00",
     )
 
-    water_rate_per_unit: Mapped[Decimal | None] = mapped_column(
+    water_rate_per_unit: Mapped[Decimal] = mapped_column(
         Numeric(10, 2),
+        nullable=False,
         server_default="0.00",
     )
 
-    is_occupied: Mapped[bool | None] = mapped_column(
+    is_occupied: Mapped[bool] = mapped_column(
         Boolean,
+        nullable=False,
         server_default="false",
     )
 
-    created_at: Mapped[datetime | None] = mapped_column(
+    created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default="CURRENT_TIMESTAMP",
     )
@@ -112,12 +107,11 @@ class Unit(Base):
     )
 
     ledger_entries: Mapped[list["LedgerEntry"]] = relationship(
-        "LedgerEntry",
-        back_populates="unit",
-    )
+    "LedgerEntry",
+    back_populates="unit",
+)
 
-    unassigned_payments: Mapped[list["UnassignedPayment"]] = relationship(
-        "UnassignedPayment",
-        back_populates="resolved_unit",
-    )
-    
+ledger_entries: Mapped[list["LedgerEntry"]] = relationship(
+    "LedgerEntry",
+    back_populates="unit",
+)

@@ -1,4 +1,5 @@
-from sqlalchemy import text
+from sqlalchemy import func, select, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -27,32 +28,23 @@ class PaymentProcessingRepository:
             False -> receipt already exists.
         """
 
-        result = await self.db.execute(
-            text(
-                """
-                INSERT INTO payment_processing (
-                    mpesa_receipt_number,
-                    raw_webhook_id,
-                    landlord_id,
-                    status
-                )
-                VALUES (
-                    :receipt,
-                    :raw_webhook_id,
-                    :landlord_id,
-                    'PROCESSING'
-                )
-                ON CONFLICT (mpesa_receipt_number) DO NOTHING
-                RETURNING id
-                """
-            ),
-            {
-                "receipt": receipt,
-                "raw_webhook_id": raw_webhook_id,
-                "landlord_id": landlord_id,
-            },
+        from app.models.payment_processing import PaymentProcessing
+
+        stmt = (
+            insert(PaymentProcessing)
+            .values(
+                mpesa_receipt_number=receipt,
+                raw_webhook_id=raw_webhook_id,
+                landlord_id=landlord_id,
+                status="PROCESSING",
+            )
+            .on_conflict_do_nothing(
+                index_elements=[PaymentProcessing.mpesa_receipt_number],
+            )
+            .returning(PaymentProcessing.id)
         )
 
+        result = await self.db.execute(stmt)
         return result.scalar_one_or_none() is not None
 
     async def exists(
@@ -63,18 +55,12 @@ class PaymentProcessingRepository:
         Check whether a payment receipt has already been processed.
         """
 
+        from app.models.payment_processing import PaymentProcessing
+
         result = await self.db.execute(
-            text(
-                """
-                SELECT id
-                FROM payment_processing
-                WHERE mpesa_receipt_number = :receipt
-                LIMIT 1
-                """
-            ),
-            {
-                "receipt": receipt,
-            },
+            select(PaymentProcessing.id)
+            .where(PaymentProcessing.mpesa_receipt_number == receipt)
+            .limit(1)
         )
 
         return result.scalar_one_or_none() is not None
@@ -88,20 +74,13 @@ class PaymentProcessingRepository:
         Update payment processing state and completion timestamp.
         """
 
-        await self.db.execute(
-            text(
-                """
-                UPDATE payment_processing
-                SET
-                    status = :status,
-                    processed_at = NOW()
-                WHERE mpesa_receipt_number = :receipt
-                """
-            ),
-            {
-                "receipt": receipt,
-                "status": status,
-            },
-        )
+        from app.models.payment_processing import PaymentProcessing
 
-        
+        await self.db.execute(
+            update(PaymentProcessing)
+            .where(PaymentProcessing.mpesa_receipt_number == receipt)
+            .values(
+                status=status,
+                processed_at=func.now(),
+            )
+        )

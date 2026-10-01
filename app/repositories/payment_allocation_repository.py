@@ -1,7 +1,8 @@
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -19,42 +20,34 @@ class PaymentAllocationRepository:
         amount: Decimal,
         status: str = "ALLOCATED",
     ) -> dict[str, Any]:
+        from app.models.payment_allocation import PaymentAllocation
+
+        stmt = (
+            insert(PaymentAllocation)
+            .values(
+                payment_transaction_id=payment_transaction_id,
+                invoice_id=invoice_id,
+                amount=amount,
+                status=status,
+            )
+            .on_conflict_do_nothing(
+                index_elements=[
+                    PaymentAllocation.payment_transaction_id,
+                    PaymentAllocation.invoice_id,
+                ],
+            )
+            .returning(
+                PaymentAllocation.id,
+                PaymentAllocation.payment_transaction_id,
+                PaymentAllocation.invoice_id,
+                PaymentAllocation.amount,
+                PaymentAllocation.status,
+                PaymentAllocation.created_at,
+                PaymentAllocation.reversed_at,
+            )
+        )
         result = await self.db.execute(
-            text(
-                """
-                INSERT INTO payment_allocations (
-                    payment_transaction_id,
-                    invoice_id,
-                    amount,
-                    status
-                )
-                VALUES (
-                    :payment_transaction_id,
-                    :invoice_id,
-                    :amount,
-                    :status
-                )
-                ON CONFLICT (
-                    payment_transaction_id,
-                    invoice_id
-                )
-                DO NOTHING
-                RETURNING
-                    id,
-                    payment_transaction_id,
-                    invoice_id,
-                    amount,
-                    status,
-                    created_at,
-                    reversed_at
-                """
-            ),
-            {
-                "payment_transaction_id": payment_transaction_id,
-                "invoice_id": invoice_id,
-                "amount": amount,
-                "status": status,
-            },
+            stmt
         )
 
         row = result.mappings().first()
@@ -80,27 +73,24 @@ class PaymentAllocationRepository:
         payment_transaction_id: str,
         invoice_id: str,
     ) -> dict[str, Any] | None:
+        from app.models.payment_allocation import PaymentAllocation
+
         result = await self.db.execute(
-            text(
-                """
-                SELECT
-                    id,
-                    payment_transaction_id,
-                    invoice_id,
-                    amount,
-                    status,
-                    created_at,
-                    reversed_at
-                FROM payment_allocations
-                WHERE payment_transaction_id = :payment_transaction_id
-                  AND invoice_id = :invoice_id
-                LIMIT 1
-                """
-            ),
-            {
-                "payment_transaction_id": payment_transaction_id,
-                "invoice_id": invoice_id,
-            },
+            select(
+                PaymentAllocation.id,
+                PaymentAllocation.payment_transaction_id,
+                PaymentAllocation.invoice_id,
+                PaymentAllocation.amount,
+                PaymentAllocation.status,
+                PaymentAllocation.created_at,
+                PaymentAllocation.reversed_at,
+            )
+            .where(
+                PaymentAllocation.payment_transaction_id
+                == payment_transaction_id,
+                PaymentAllocation.invoice_id == invoice_id,
+            )
+            .limit(1)
         )
 
         row = result.mappings().first()

@@ -10,10 +10,8 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base
 
-
 if TYPE_CHECKING:
     from app.models.payment_processing import PaymentProcessing
-    from app.models.payment_transaction import PaymentTransaction
     from app.models.unassigned_payment import UnassignedPayment
 
 
@@ -69,17 +67,17 @@ class RawPaymentWebhook(Base):
         server_default="CURRENT_TIMESTAMP",
     )
 
-    payment_processing_records: Mapped[list["PaymentProcessing"]] = relationship(
-        "PaymentProcessing",
-        back_populates="raw_webhook",
-    )
-
     unassigned_payments: Mapped[list["UnassignedPayment"]] = relationship(
         "UnassignedPayment",
         back_populates="raw_webhook",
     )
 
-    payment_transactions: Mapped[list["PaymentTransaction"]] = relationship(
+payment_processing_records: Mapped[list["PaymentProcessing"]] = relationship(
+    "PaymentProcessing",
+    back_populates="raw_webhook",
+)
+
+payment_transactions: Mapped[list["PaymentTransaction"]] = relationship(
         "PaymentTransaction",
         back_populates="raw_webhook",
     )

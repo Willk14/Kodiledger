@@ -2,7 +2,8 @@ from decimal import Decimal
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -27,6 +28,7 @@ class PaymentTransactionRepository:
         payment_method: str,
         status: str = "COMPLETED",
     ) -> dict[str, Any]:
+        from app.models.payment_transaction import PaymentTransaction
 
         # Calculate completed_at in Python instead of using
         # CASE :status = 'COMPLETED' in PostgreSQL.
@@ -36,71 +38,44 @@ class PaymentTransactionRepository:
             else None
         )
 
-        result = await self.db.execute(
-            text(
-                """
-                INSERT INTO payment_transactions (
-                    landlord_id,
-                    tenant_id,
-                    raw_webhook_id,
-                    merchant_request_id,
-                    checkout_request_id,
-                    mpesa_receipt_number,
-                    payer_phone,
-                    payer_name,
-                    amount,
-                    payment_method,
-                    status,
-                    completed_at
-                )
-                VALUES (
-                    :landlord_id,
-                    :tenant_id,
-                    :raw_webhook_id,
-                    :merchant_request_id,
-                    :checkout_request_id,
-                    :mpesa_receipt_number,
-                    :payer_phone,
-                    :payer_name,
-                    :amount,
-                    :payment_method,
-                    CAST(:status AS payment_transaction_status_enum),
-                    :completed_at
-                )
-                ON CONFLICT (mpesa_receipt_number) DO NOTHING
-                RETURNING
-                    id,
-                    landlord_id,
-                    tenant_id,
-                    raw_webhook_id,
-                    merchant_request_id,
-                    checkout_request_id,
-                    mpesa_receipt_number,
-                    payer_phone,
-                    payer_name,
-                    amount,
-                    payment_method,
-                    status,
-                    created_at,
-                    completed_at
-                """
-            ),
-            {
-                "landlord_id": landlord_id,
-                "tenant_id": tenant_id,
-                "raw_webhook_id": raw_webhook_id,
-                "merchant_request_id": merchant_request_id,
-                "checkout_request_id": checkout_request_id,
-                "mpesa_receipt_number": mpesa_receipt_number,
-                "payer_phone": payer_phone,
-                "payer_name": payer_name,
-                "amount": amount,
-                "payment_method": payment_method,
-                "status": status,
-                "completed_at": completed_at,
-            },
+        stmt = (
+            insert(PaymentTransaction)
+            .values(
+                landlord_id=landlord_id,
+                tenant_id=tenant_id,
+                raw_webhook_id=raw_webhook_id,
+                merchant_request_id=merchant_request_id,
+                checkout_request_id=checkout_request_id,
+                mpesa_receipt_number=mpesa_receipt_number,
+                payer_phone=payer_phone,
+                payer_name=payer_name,
+                amount=amount,
+                payment_method=payment_method,
+                status=status,
+                completed_at=completed_at,
+            )
+            .on_conflict_do_nothing(
+                index_elements=[PaymentTransaction.mpesa_receipt_number],
+            )
+            .returning(
+                PaymentTransaction.id,
+                PaymentTransaction.landlord_id,
+                PaymentTransaction.tenant_id,
+                PaymentTransaction.raw_webhook_id,
+                PaymentTransaction.merchant_request_id,
+                PaymentTransaction.checkout_request_id,
+                PaymentTransaction.mpesa_receipt_number,
+                PaymentTransaction.payer_phone,
+                PaymentTransaction.payer_name,
+                PaymentTransaction.amount,
+                PaymentTransaction.payment_method,
+                PaymentTransaction.status,
+                PaymentTransaction.created_at,
+                PaymentTransaction.completed_at,
+            )
         )
 
+        result = await self.db.execute(stmt)
         row = result.mappings().first()
 
         if row:
@@ -120,33 +95,30 @@ class PaymentTransactionRepository:
         self,
         mpesa_receipt_number: str,
     ) -> dict[str, Any] | None:
+        from app.models.payment_transaction import PaymentTransaction
 
         result = await self.db.execute(
-            text(
-                """
-                SELECT
-                    id,
-                    landlord_id,
-                    tenant_id,
-                    raw_webhook_id,
-                    merchant_request_id,
-                    checkout_request_id,
-                    mpesa_receipt_number,
-                    payer_phone,
-                    payer_name,
-                    amount,
-                    payment_method,
-                    status,
-                    created_at,
-                    completed_at
-                FROM payment_transactions
-                WHERE mpesa_receipt_number = :mpesa_receipt_number
-                LIMIT 1
-                """
-            ),
-            {
-                "mpesa_receipt_number": mpesa_receipt_number,
-            },
+            select(
+                PaymentTransaction.id,
+                PaymentTransaction.landlord_id,
+                PaymentTransaction.tenant_id,
+                PaymentTransaction.raw_webhook_id,
+                PaymentTransaction.merchant_request_id,
+                PaymentTransaction.checkout_request_id,
+                PaymentTransaction.mpesa_receipt_number,
+                PaymentTransaction.payer_phone,
+                PaymentTransaction.payer_name,
+                PaymentTransaction.amount,
+                PaymentTransaction.payment_method,
+                PaymentTransaction.status,
+                PaymentTransaction.created_at,
+                PaymentTransaction.completed_at,
+            )
+            .where(
+                PaymentTransaction.mpesa_receipt_number
+                == mpesa_receipt_number
+            )
+            .limit(1)
         )
 
         row = result.mappings().first()

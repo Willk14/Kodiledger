@@ -1,21 +1,19 @@
 from __future__ import annotations
-
 from datetime import datetime
 from decimal import Decimal
-from typing import TYPE_CHECKING
 from uuid import UUID
-
+from typing import TYPE_CHECKING
 from sqlalchemy import CheckConstraint, ForeignKey, Index, Numeric, String, text
 from sqlalchemy.dialects.postgresql import ENUM, UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from typing import TYPE_CHECKING
+from uuid import UUID
 
 from app.models.base import Base
-
-
 if TYPE_CHECKING:
+    from app.models.landlord import Landlord
     from app.models.raw_payment_webhook import RawPaymentWebhook
-    from app.models.payment_credit import PaymentCredit
-    from app.models.payment_allocation import PaymentAllocation
+    from app.models.tenant import Tenant
 
 
 payment_transaction_status_enum = ENUM(
@@ -145,19 +143,18 @@ class PaymentTransaction(Base):
         ),
     )
 
+    landlord: Mapped["Landlord"] = relationship(
+        "Landlord",
+        back_populates="payment_transactions",
+    )
+
+    tenant: Mapped["Tenant | None"] = relationship(
+        "Tenant",
+        back_populates="payment_transactions",
+    )
+
     raw_webhook: Mapped["RawPaymentWebhook | None"] = relationship(
         "RawPaymentWebhook",
         back_populates="payment_transactions",
     )
-
-    payment_allocations: Mapped[list["PaymentAllocation"]] = relationship(
-        "PaymentAllocation",
-        back_populates="payment_transaction",
-    )
-
-    payment_credits: Mapped[list["PaymentCredit"]] = relationship(
-        "PaymentCredit",
-        back_populates="payment_transaction",
-    )
-
     

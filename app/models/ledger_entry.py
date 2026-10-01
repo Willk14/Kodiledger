@@ -61,6 +61,7 @@ class LedgerEntry(Base):
         Index("idx_ledger_unit", "unit_id"),
         Index("idx_ledger_tenant", "tenant_id"),
         Index("idx_ledger_receipt", "mpesa_receipt_number"),
+        Index("idx_ledger_payment_transaction", "payment_transaction_id"),
     )
 
 
@@ -90,6 +91,11 @@ class LedgerEntry(Base):
     invoice_id: Mapped[UUID | None] = mapped_column(
         PG_UUID(as_uuid=True),
         ForeignKey("invoices.id", ondelete="SET NULL"),
+    )
+
+    payment_transaction_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("payment_transactions.id", ondelete="RESTRICT"),
     )
 
     mpesa_receipt_number: Mapped[str | None] = mapped_column(

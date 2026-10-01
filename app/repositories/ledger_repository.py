@@ -1,6 +1,7 @@
 from decimal import Decimal
 
-from sqlalchemy import text
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -32,59 +33,34 @@ class LedgerRepository:
         payment_transactions record.
         """
 
-        await self.db.execute(
-            text(
-                """
-                INSERT INTO ledger_entries (
-                    landlord_id,
-                    unit_id,
-                    tenant_id,
-                    mpesa_receipt_number,
-                    merchant_request_id,
-                    payment_transaction_id,
-                    entry_type,
-                    amount,
-                    payment_method,
-                    status,
-                    payer_phone,
-                    account_reference_used,
-                    description
-                )
-                VALUES (
-                    :landlord_id,
-                    :unit_id,
-                    :tenant_id,
-                    :mpesa_receipt,
-                    :merchant_request_id,
-                    :payment_transaction_id,
-                    'CREDIT',
-                    :amount,
-                    'MPESA_STK_PUSH',
-                    'COMPLETED',
-                    :phone,
-                    :account_ref,
-                    :description
-                )
-                ON CONFLICT (mpesa_receipt_number) DO NOTHING
-                """
-            ),
-            {
-                "landlord_id": landlord_id,
-                "unit_id": unit_id,
-                "tenant_id": tenant_id,
-                "mpesa_receipt": mpesa_receipt,
-                "merchant_request_id": merchant_request_id,
-                "payment_transaction_id": payment_transaction_id,
-                "amount": amount,
-                "phone": phone,
-                "account_ref": account_ref,
-                "description": (
+        from app.models.ledger_entry import LedgerEntry
+
+        stmt = (
+            insert(LedgerEntry)
+            .values(
+                landlord_id=landlord_id,
+                unit_id=unit_id,
+                tenant_id=tenant_id,
+                mpesa_receipt_number=mpesa_receipt,
+                merchant_request_id=merchant_request_id,
+                payment_transaction_id=payment_transaction_id,
+                entry_type="CREDIT",
+                amount=amount,
+                payment_method="MPESA_STK_PUSH",
+                status="COMPLETED",
+                payer_phone=phone,
+                account_reference_used=account_ref,
+                description=(
                     description
                     or f"M-Pesa STK Push Payment - "
                        f"Receipt: {mpesa_receipt}"
                 ),
-            },
+            )
+            .on_conflict_do_nothing(
+                index_elements=[LedgerEntry.mpesa_receipt_number],
+            )
         )
+        await self.db.execute(stmt)
 
     async def get_by_receipt(
         self,
@@ -94,35 +70,30 @@ class LedgerRepository:
         Retrieve a ledger entry by M-Pesa receipt number.
         """
 
+        from app.models.ledger_entry import LedgerEntry
+
         result = await self.db.execute(
-            text(
-                """
-                SELECT
-                    id,
-                    landlord_id,
-                    unit_id,
-                    tenant_id,
-                    invoice_id,
-                    payment_transaction_id,
-                    mpesa_receipt_number,
-                    merchant_request_id,
-                    entry_type,
-                    amount,
-                    payment_method,
-                    status,
-                    payer_phone,
-                    payer_name,
-                    account_reference_used,
-                    description,
-                    created_at
-                FROM ledger_entries
-                WHERE mpesa_receipt_number = :receipt
-                LIMIT 1
-                """
-            ),
-            {
-                "receipt": mpesa_receipt,
-            },
+            select(
+                LedgerEntry.id,
+                LedgerEntry.landlord_id,
+                LedgerEntry.unit_id,
+                LedgerEntry.tenant_id,
+                LedgerEntry.invoice_id,
+                LedgerEntry.payment_transaction_id,
+                LedgerEntry.mpesa_receipt_number,
+                LedgerEntry.merchant_request_id,
+                LedgerEntry.entry_type,
+                LedgerEntry.amount,
+                LedgerEntry.payment_method,
+                LedgerEntry.status,
+                LedgerEntry.payer_phone,
+                LedgerEntry.payer_name,
+                LedgerEntry.account_reference_used,
+                LedgerEntry.description,
+                LedgerEntry.created_at,
+            )
+            .where(LedgerEntry.mpesa_receipt_number == mpesa_receipt)
+            .limit(1)
         )
 
         ledger_entry = result.mappings().first()

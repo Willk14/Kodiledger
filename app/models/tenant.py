@@ -5,7 +5,7 @@ from decimal import Decimal
 from uuid import UUID
 from typing import TYPE_CHECKING
 from app.models.ledger_entry import LedgerEntry
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Numeric, String
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Numeric, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.models.invoice import Invoice
@@ -14,11 +14,15 @@ from app.models.base import Base
 if TYPE_CHECKING:
     from app.models.invoice import Invoice
     from app.models.landlord import Landlord
+    from app.models.payment_credit import PaymentCredit
     from app.models.unit import Unit
 
 
 class Tenant(Base):
     __tablename__ = "tenants"
+    __table_args__ = (
+        UniqueConstraint("id", "landlord_id", name="uq_tenants_id_landlord_id"),
+    )
 
     id: Mapped[UUID] = mapped_column(
         PG_UUID(as_uuid=True),
@@ -92,21 +96,21 @@ class Tenant(Base):
     )
 
     invoices: Mapped[list["Invoice"]] = relationship(
-    "Invoice",
-    back_populates="tenant",
-)
+        "Invoice",
+        back_populates="tenant",
+    )
 
-ledger_entries: Mapped[list["LedgerEntry"]] = relationship(
-    "LedgerEntry",
-    back_populates="tenant",
-)
+    ledger_entries: Mapped[list["LedgerEntry"]] = relationship(
+        "LedgerEntry",
+        back_populates="tenant",
+    )
 
-payment_transactions: Mapped[list["PaymentTransaction"]] = relationship(
+    payment_transactions: Mapped[list["PaymentTransaction"]] = relationship(
         "PaymentTransaction",
         back_populates="tenant",
     )
 
-payment_transactions: Mapped[list["PaymentTransaction"]] = relationship(
-        "PaymentTransaction",
+    payment_credits: Mapped[list["PaymentCredit"]] = relationship(
+        "PaymentCredit",
         back_populates="tenant",
     )

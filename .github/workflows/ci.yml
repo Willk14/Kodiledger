@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      ENVIRONMENT: test
+      DEBUG: "false"
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ci-only-not-a-secret
+      POSTGRES_DB: kodiflow_db
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: "5434"
+      # Keep ordinary app settings distinct from the dedicated RLS test target.
+      # Tests that need PostgreSQL override their session with .env.rls-test.
+      DATABASE_URL: postgresql+asyncpg://kodiflow_app:ci-only-not-a-secret@127.0.0.1:5434/kodiflow_db
+      SYSTEM_DATABASE_URL: postgresql+asyncpg://kodiflow_system:ci-only-not-a-secret@127.0.0.1:5434/kodiflow_db
+      REDIS_URL: redis://127.0.0.1:6379/0
+      MPESA_CONSUMER_KEY: ci-test-key
+      MPESA_CONSUMER_SECRET: ci-test-secret
+      MPESA_PASSKEY: ci-test-passkey
+      MPESA_SHORTCODE: "174379"
+      MPESA_CALLBACK_URL: https://example.test/mpesa-callback
+      OIDC_ISSUER_URL: https://issuer.example.test/
+      OIDC_AUDIENCE: kodiledger-api
+      OIDC_JWKS_URL: https://issuer.example.test/.well-known/jwks.json
+      OIDC_SIGNING_ALGORITHMS: RS256
+      KAFKA_BOOTSTRAP_SERVERS: 127.0.0.1:9092
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Configure isolated RLS test database
+        shell: bash
+        run: |
+          cat > .env.rls-test <<'EOF'
+          RLS_TEST_PORT=5435
+          RLS_TEST_POSTGRES_PASSWORD=ci-only-rls-postgres
+          RLS_TEST_APP_PASSWORD=ci-only-rls-app
+          RLS_TEST_SYSTEM_PASSWORD=ci-only-rls-system
+          RLS_TEST_ADMIN_BOOTSTRAP_DATABASE_URL=postgresql://postgres:ci-only-rls-postgres@127.0.0.1:5435/kodiflow_db
+          RLS_TEST_ADMIN_DATABASE_URL=postgresql://postgres:ci-only-rls-postgres@127.0.0.1:5435/kodiflow_test
+          RLS_TEST_DATABASE_URL=postgresql+asyncpg://kodiflow_app:ci-only-rls-app@127.0.0.1:5435/kodiflow_test
+          RLS_TEST_SYSTEM_DATABASE_URL=postgresql+asyncpg://kodiflow_system:ci-only-rls-system@127.0.0.1:5435/kodiflow_test
+          EOF
+
+      - name: Start isolated PostgreSQL
+        run: docker compose -f docker-compose.rls-test.yml --env-file .env.rls-test up -d --wait
+
+      - name: Start Kafka test broker
+        run: docker compose -f docker-compose.yml up -d kafka
+
+      - name: Wait for Kafka test broker
+        shell: bash
+        run: |
+          for attempt in {1..60}; do
+            if docker exec kodiflow_kafka /opt/kafka/bin/kafka-topics.sh \
+              --bootstrap-server localhost:9092 --list >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Kafka did not become ready within 120 seconds."
+          exit 1
+
+      - name: Initialize and verify RLS database
+        run: python -m app.Tests.rls_test_database
+
+      - name: Run focused PostgreSQL RLS tests
+        run: python -m pytest -q app/Tests/security/test_postgres_rls.py
+
+      - name: Run security regression suite
+        run: python -m pytest -q app/Tests/security
+
+      - name: Run PostgreSQL webhook integration tests
+        run: python -m pytest -q app/Tests/integration/test_webhook_integration.py
+
+      - name: Run full test suite
+        run: python -m pytest -q

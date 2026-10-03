@@ -12,6 +12,7 @@ from app.models.base import Base
 
 if TYPE_CHECKING:
     from app.models.payment_processing import PaymentProcessing
+    from app.models.payment_transaction import PaymentTransaction
     from app.models.unassigned_payment import UnassignedPayment
 
 
@@ -72,12 +73,12 @@ class RawPaymentWebhook(Base):
         back_populates="raw_webhook",
     )
 
-payment_processing_records: Mapped[list["PaymentProcessing"]] = relationship(
-    "PaymentProcessing",
-    back_populates="raw_webhook",
-)
+    payment_processing_records: Mapped[list["PaymentProcessing"]] = relationship(
+        "PaymentProcessing",
+        back_populates="raw_webhook",
+    )
 
-payment_transactions: Mapped[list["PaymentTransaction"]] = relationship(
+    payment_transactions: Mapped[list["PaymentTransaction"]] = relationship(
         "PaymentTransaction",
         back_populates="raw_webhook",
     )

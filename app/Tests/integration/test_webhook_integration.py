@@ -1,23 +1,42 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import date
+from pathlib import Path
 
 from uuid import uuid4
 
 import httpx
 import pytest
+import pytest_asyncio
+from dotenv import dotenv_values
 from sqlalchemy import text
 from app.repositories.outbox_event_repository import OutboxEventRepository
 from app.services.outbox_worker import OutboxWorker
 from app.services.test_event_publisher import TestEventPublisher
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
+from sqlalchemy.engine import make_url
 
+from app.core.database import get_system_db
 from app.core.config import settings
+from app.main import app
 
+
+ROOT = Path(__file__).resolve().parents[3]
+RLS_TEST_ENV = ROOT / ".env.rls-test"
+RLS_TEST_VALUES = {
+    key: value for key, value in dotenv_values(RLS_TEST_ENV).items() if value
+}
+RLS_SYSTEM_DATABASE_URL = RLS_TEST_VALUES.get("RLS_TEST_SYSTEM_DATABASE_URL")
+if not RLS_SYSTEM_DATABASE_URL:
+    pytest.skip(
+        "Webhook PostgreSQL integration tests require .env.rls-test.",
+        allow_module_level=True,
+    )
 
 test_system_engine = create_async_engine(
-    settings.SYSTEM_DATABASE_URL,
+    make_url(RLS_SYSTEM_DATABASE_URL).set(drivername="postgresql+asyncpg"),
     echo=False,
     future=True,
     poolclass=NullPool,
@@ -30,13 +49,100 @@ TestSystemSessionLocal = async_sessionmaker(
 )
 
 
-BASE_URL = "http://127.0.0.1:8000"
+BASE_URL = "http://test"
 WEBHOOK_URL = f"{BASE_URL}/api/v1/webhooks/mpesa"
 
 LANDLORD_ID = "11111111-1111-1111-1111-111111111111"
 TENANT_ID = "55555555-5555-5555-5555-555555555555"
 UNIT_ID = "33333333-3333-3333-3333-333333333333"
 TENANT_PHONE = "254798765432"
+
+
+def _webhook_client(timeout: float = 30.0) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url=BASE_URL,
+        timeout=timeout,
+    )
+
+
+async def _test_system_db():
+    async with TestSystemSessionLocal() as session:
+        yield session
+
+
+async def _clean_webhook_test_data(db: AsyncSession) -> None:
+    transaction_ids = "SELECT id FROM payment_transactions WHERE mpesa_receipt_number LIKE 'IT-%'"
+    await db.execute(text(f"DELETE FROM outbox_events WHERE idempotency_key LIKE 'IT-%' OR aggregate_id IN ({transaction_ids})"))
+    await db.execute(text(f"DELETE FROM payment_credits WHERE payment_transaction_id IN ({transaction_ids})"))
+    await db.execute(text(f"DELETE FROM payment_allocations WHERE payment_transaction_id IN ({transaction_ids})"))
+    await db.execute(text(f"DELETE FROM ledger_entries WHERE payment_transaction_id IN ({transaction_ids}) OR invoice_id IN (SELECT id FROM invoices WHERE invoice_number LIKE 'IT-%')"))
+    await db.execute(text("DELETE FROM unassigned_payments WHERE mpesa_receipt_number LIKE 'IT-%'"))
+    await db.execute(text("DELETE FROM payment_transactions WHERE mpesa_receipt_number LIKE 'IT-%'"))
+    await db.execute(text("DELETE FROM payment_processing WHERE mpesa_receipt_number LIKE 'IT-%'"))
+    await db.execute(text("DELETE FROM raw_payment_webhooks WHERE mpesa_receipt_number LIKE 'IT-%' OR merchant_request_id LIKE 'IT-%'"))
+    await db.execute(text("DELETE FROM invoices WHERE invoice_number LIKE 'IT-%'"))
+    await db.commit()
+
+
+@pytest_asyncio.fixture(scope="session", autouse=True)
+async def webhook_test_database():
+    async with TestSystemSessionLocal() as db:
+        await _clean_webhook_test_data(db)
+        await db.execute(text("""
+            INSERT INTO landlords (id, full_name, email, phone_number, business_shortcode)
+            VALUES (:id, 'Webhook Integration Landlord', 'webhook-integration@example.test', '254799000001', :shortcode)
+            ON CONFLICT (id) DO UPDATE SET full_name = EXCLUDED.full_name,
+                                          business_shortcode = EXCLUDED.business_shortcode
+        """), {"id": LANDLORD_ID, "shortcode": settings.MPESA_SHORTCODE})
+        await db.execute(text("""
+            INSERT INTO properties (id, landlord_id, name, county, town_location, total_units)
+            VALUES ('22222222-2222-2222-2222-222222222222', :landlord_id,
+                    'Webhook Integration Property', 'Test County', 'Test Town', 1)
+            ON CONFLICT (id) DO UPDATE SET landlord_id = EXCLUDED.landlord_id
+        """), {"landlord_id": LANDLORD_ID})
+        await db.execute(text("""
+            INSERT INTO units (id, property_id, landlord_id, unit_number, base_rent,
+                               garbage_fee, water_rate_per_unit, is_occupied)
+            VALUES (:id, '22222222-2222-2222-2222-222222222222', :landlord_id,
+                    'A4', 15000, 500, 150, TRUE)
+            ON CONFLICT (id) DO UPDATE SET landlord_id = EXCLUDED.landlord_id
+        """), {"id": UNIT_ID, "landlord_id": LANDLORD_ID})
+        await db.execute(text("""
+            INSERT INTO tenants (id, landlord_id, unit_id, full_name, primary_phone,
+                                 lease_start_date, deposit_amount)
+            VALUES (:id, :landlord_id, :unit_id, 'Webhook Integration Tenant',
+                    :phone, :lease_start, 15000)
+            ON CONFLICT (id) DO UPDATE SET primary_phone = EXCLUDED.primary_phone,
+                                          landlord_id = EXCLUDED.landlord_id,
+                                          unit_id = EXCLUDED.unit_id
+        """), {"id": TENANT_ID, "landlord_id": LANDLORD_ID, "unit_id": UNIT_ID,
+              "phone": TENANT_PHONE, "lease_start": date(2026, 1, 1)})
+        await db.commit()
+
+    yield
+
+    async with TestSystemSessionLocal() as db:
+        await _clean_webhook_test_data(db)
+        await db.execute(text("DELETE FROM tenants WHERE id = :id"), {"id": TENANT_ID})
+        await db.execute(text("DELETE FROM units WHERE id = :id"), {"id": UNIT_ID})
+        await db.execute(text("DELETE FROM properties WHERE id = '22222222-2222-2222-2222-222222222222'"))
+        await db.execute(text("DELETE FROM landlords WHERE id = :id"), {"id": LANDLORD_ID})
+        await db.commit()
+        await test_system_engine.dispose()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def webhook_api_test_database():
+    previous = app.dependency_overrides.get(get_system_db)
+    app.dependency_overrides[get_system_db] = _test_system_db
+    try:
+        yield
+    finally:
+        if previous is None:
+            app.dependency_overrides.pop(get_system_db, None)
+        else:
+            app.dependency_overrides[get_system_db] = previous
 
 
 def callback_payload(receipt: str, merchant: str, checkout: str, amount: int):
@@ -124,7 +230,7 @@ async def test_matched_webhook_is_idempotent():
         await db.commit()
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with _webhook_client() as client:
             first = await client.post(
                 WEBHOOK_URL,
                 json=callback_payload(
@@ -357,7 +463,7 @@ async def test_successful_webhook_creates_unassigned_payment():
     unmatched_phone = "254700000001"
     amount = 250
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with _webhook_client() as client:
         response = await client.post(
             WEBHOOK_URL,
             json={
@@ -540,12 +646,6 @@ async def test_successful_webhook_creates_unassigned_payment():
         await db.commit()
 
         
-@pytest.fixture(scope="session", autouse=True)
-async def close_test_engine():
-    yield
-    await test_system_engine.dispose()
-
-
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_failed_webhook_is_audited_without_financial_processing():
@@ -559,7 +659,7 @@ async def test_failed_webhook_is_audited_without_financial_processing():
     result_desc = "Request cancelled by user"
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with _webhook_client() as client:
             response = await client.post(
                 WEBHOOK_URL,
                 json={
@@ -750,7 +850,7 @@ async def test_concurrent_duplicate_webhooks_create_one_financial_chain():
     )
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with _webhook_client() as client:
             responses = await asyncio.gather(
                 client.post(WEBHOOK_URL, json=payload),
                 client.post(WEBHOOK_URL, json=payload),
@@ -1088,7 +1188,7 @@ async def test_overpayment_allocates_invoice_and_creates_payment_credit():
         await db.commit()
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with _webhook_client() as client:
             response = await client.post(
                 WEBHOOK_URL,
                 json=callback_payload(
@@ -1453,7 +1553,7 @@ async def test_partial_payment_allocates_invoice_without_payment_credit():
         await db.commit()
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with _webhook_client() as client:
             response = await client.post(
                 WEBHOOK_URL,
                 json=callback_payload(
@@ -1811,7 +1911,7 @@ async def test_exact_payment_fully_allocates_invoice_without_payment_credit():
         await db.commit()
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with _webhook_client() as client:
             response = await client.post(
                 WEBHOOK_URL,
                 json=callback_payload(
@@ -2191,7 +2291,7 @@ async def test_concurrent_different_payments_cannot_overallocate_same_invoice():
     )
 
     async def send_payment(payload):
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with _webhook_client() as client:
             return await client.post(
                 WEBHOOK_URL,
                 json=payload,
@@ -2631,16 +2731,20 @@ async def test_outbox_claim_pending_locks_and_returns_event():
         async with TestSystemSessionLocal() as db:
             repository = OutboxEventRepository(db)
 
-            events = await repository.claim_pending(limit=10)
+            claimed = None
+            while claimed is None:
+                events = await repository.claim_pending(limit=10)
+                claimed = next(
+                    (
+                        event
+                        for event in events
+                        if event["id"] == event_id
+                    ),
+                    None,
+                )
 
-            claimed = next(
-                (
-                    event
-                    for event in events
-                    if event["id"] == event_id
-                ),
-                None,
-            )
+                if claimed is None and len(events) < 10:
+                    break
 
             assert claimed is not None
             assert claimed["status"] == "PENDING"

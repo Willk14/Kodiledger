@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from app.models.property import Property
     from app.models.tenant import Tenant
     from app.models.utility_reading import UtilityReading
+    from app.models.unassigned_payment import UnassignedPayment
 
 
 class Unit(Base):
@@ -107,11 +108,11 @@ class Unit(Base):
     )
 
     ledger_entries: Mapped[list["LedgerEntry"]] = relationship(
-    "LedgerEntry",
-    back_populates="unit",
-)
+        "LedgerEntry",
+        back_populates="unit",
+    )
 
-ledger_entries: Mapped[list["LedgerEntry"]] = relationship(
-    "LedgerEntry",
-    back_populates="unit",
-)
+    unassigned_payments: Mapped[list["UnassignedPayment"]] = relationship(
+        "UnassignedPayment",
+        back_populates="resolved_unit",
+    )

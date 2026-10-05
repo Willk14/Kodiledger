@@ -84,3 +84,25 @@ class PaymentProcessingRepository:
                 processed_at=func.now(),
             )
         )
+
+    async def mark_assigned(
+        self,
+        *,
+        receipt: str,
+        landlord_id: str,
+    ) -> None:
+        """Move an unmatched successful receipt to completed state."""
+        from app.models.payment_processing import PaymentProcessing
+
+        await self.db.execute(
+            update(PaymentProcessing)
+            .where(
+                PaymentProcessing.mpesa_receipt_number == receipt,
+                PaymentProcessing.landlord_id == landlord_id,
+                PaymentProcessing.status == "UNASSIGNED",
+            )
+            .values(
+                status="COMPLETED",
+                processed_at=func.now(),
+            )
+        )

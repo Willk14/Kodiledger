@@ -1,8 +1,18 @@
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.invoice import Invoice
+from app.models.property import Property
+from app.models.tenant import Tenant
+from app.models.unit import Unit
+
+
+class DuplicateInvoiceNumberError(Exception):
+    """Raised when PostgreSQL rejects a duplicate invoice number."""
 
 
 class InvoiceRepository:
@@ -10,6 +20,93 @@ class InvoiceRepository:
 
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
+
+    async def list_by_landlord(self, landlord_id: str) -> list[Invoice]:
+        result = await self.db.execute(
+            select(Invoice)
+            .where(Invoice.landlord_id == landlord_id)
+            .order_by(
+                Invoice.billing_month.asc(),
+                Invoice.created_at.asc(),
+                Invoice.id.asc(),
+            )
+        )
+        return list(result.scalars().all())
+
+    async def get_by_id_and_landlord(
+        self,
+        *,
+        invoice_id: str,
+        landlord_id: str,
+    ) -> Invoice | None:
+        result = await self.db.execute(
+            select(Invoice).where(
+                Invoice.id == invoice_id,
+                Invoice.landlord_id == landlord_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def unit_belongs_to_landlord(
+        self,
+        *,
+        unit_id: str,
+        landlord_id: str,
+    ) -> bool:
+        result = await self.db.execute(
+            select(Unit.id)
+            .join(Property, Unit.property_id == Property.id)
+            .where(
+                Unit.id == unit_id,
+                Unit.landlord_id == landlord_id,
+                Property.landlord_id == landlord_id,
+            )
+        )
+        return result.scalar_one_or_none() is not None
+
+    async def tenant_belongs_to_unit_and_landlord(
+        self,
+        *,
+        tenant_id: str,
+        unit_id: str,
+        landlord_id: str,
+    ) -> bool:
+        result = await self.db.execute(
+            select(Tenant.id).where(
+                Tenant.id == tenant_id,
+                Tenant.unit_id == unit_id,
+                Tenant.landlord_id == landlord_id,
+            )
+        )
+        return result.scalar_one_or_none() is not None
+
+    async def create(
+        self,
+        *,
+        landlord_id: str,
+        values: dict[str, Any],
+    ) -> Invoice:
+        invoice = Invoice(landlord_id=landlord_id, **values)
+        self.db.add(invoice)
+        try:
+            await self.db.flush()
+            await self.db.refresh(invoice)
+            await self.db.commit()
+        except IntegrityError as exc:
+            await self.db.rollback()
+            original: BaseException | None = exc.orig
+            constraint_name = None
+            while original is not None and constraint_name is None:
+                constraint_name = getattr(original, "constraint_name", None)
+                if constraint_name is None:
+                    constraint_name = getattr(
+                        getattr(original, "diag", None), "constraint_name", None
+                    )
+                original = original.__cause__
+            if constraint_name == "invoices_invoice_number_key":
+                raise DuplicateInvoiceNumberError from exc
+            raise
+        return invoice
 
     async def get_oldest_unpaid_for_tenant_for_update(
         self,
@@ -242,5 +339,3 @@ class InvoiceRepository:
             return None
 
         return dict(row)
-
-    

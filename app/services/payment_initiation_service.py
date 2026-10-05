@@ -28,5 +28,10 @@ class PaymentInitiationService:
             transaction_description=transaction_description,
         )
 
+    async def query_mpesa_stk_push(
+        self, checkout_request_id: str
+    ) -> dict[str, Any]:
+        return await self.mpesa_client.query_stk_push(checkout_request_id)
+
 
 payment_initiation_service = PaymentInitiationService(mpesa_client)

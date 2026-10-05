@@ -324,6 +324,33 @@ def require_role_and_permission(
     return dependency
 
 
+def require_roles_and_permission(
+    permission: Permission,
+    *roles: Role,
+) -> AuthorizationDependency:
+    """Require one permission and any one of the supplied roles."""
+    allowed_roles = set(roles)
+
+    async def dependency(
+        principal: Principal = Depends(get_current_principal),
+    ) -> Principal:
+        principal_role = _normalize_role(principal.role)
+        if principal_role not in allowed_roles:
+            allowed = ", ".join(role.value for role in roles)
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"One of these roles is required: {allowed}",
+            )
+        if not has_permission(principal, permission):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Permission denied: {permission.value}",
+            )
+        return principal
+
+    return dependency
+
+
 # ============================================================
 # Role Checks
 # ============================================================

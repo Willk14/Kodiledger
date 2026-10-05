@@ -104,3 +104,26 @@ class PaymentCreditRepository:
         row = result.mappings().first()
 
         return dict(row) if row else None
+
+    async def list_for_payment_transaction(
+        self,
+        *,
+        payment_transaction_id: str,
+        landlord_id: str,
+    ) -> list[Any]:
+        from app.models.payment_credit import PaymentCredit
+        from app.models.payment_transaction import PaymentTransaction
+
+        result = await self.db.execute(
+            select(PaymentCredit)
+            .join(
+                PaymentTransaction,
+                PaymentTransaction.id == PaymentCredit.payment_transaction_id,
+            )
+            .where(
+                PaymentCredit.payment_transaction_id == payment_transaction_id,
+                PaymentTransaction.landlord_id == landlord_id,
+            )
+            .order_by(PaymentCredit.created_at.asc(), PaymentCredit.id.asc())
+        )
+        return list(result.scalars().all())

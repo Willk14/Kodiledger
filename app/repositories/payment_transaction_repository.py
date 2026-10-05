@@ -6,12 +6,78 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.payment_transaction import PaymentTransaction
+
 
 class PaymentTransactionRepository:
     """Persistence operations for normalized payment transactions."""
 
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
+
+    async def list_by_landlord(self, landlord_id: str) -> list[PaymentTransaction]:
+        result = await self.db.execute(
+            select(PaymentTransaction)
+            .where(
+                PaymentTransaction.landlord_id == landlord_id,
+                PaymentTransaction.tenant_id.is_not(None),
+            )
+            .order_by(
+                PaymentTransaction.created_at.desc(),
+                PaymentTransaction.id.desc(),
+            )
+        )
+        return list(result.scalars().all())
+
+    async def list_by_tenant(
+        self,
+        *,
+        tenant_id: str,
+        landlord_id: str,
+    ) -> list[PaymentTransaction]:
+        result = await self.db.execute(
+            select(PaymentTransaction)
+            .where(
+                PaymentTransaction.tenant_id == tenant_id,
+                PaymentTransaction.landlord_id == landlord_id,
+            )
+            .order_by(
+                PaymentTransaction.created_at.desc(),
+                PaymentTransaction.id.desc(),
+            )
+        )
+        return list(result.scalars().all())
+
+    async def get_by_id_for_landlord(
+        self,
+        *,
+        payment_id: str,
+        landlord_id: str,
+    ) -> PaymentTransaction | None:
+        result = await self.db.execute(
+            select(PaymentTransaction).where(
+                PaymentTransaction.id == payment_id,
+                PaymentTransaction.landlord_id == landlord_id,
+                PaymentTransaction.tenant_id.is_not(None),
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def get_by_id_for_tenant(
+        self,
+        *,
+        payment_id: str,
+        tenant_id: str,
+        landlord_id: str,
+    ) -> PaymentTransaction | None:
+        result = await self.db.execute(
+            select(PaymentTransaction).where(
+                PaymentTransaction.id == payment_id,
+                PaymentTransaction.tenant_id == tenant_id,
+                PaymentTransaction.landlord_id == landlord_id,
+            )
+        )
+        return result.scalar_one_or_none()
 
     async def create(
         self,
@@ -123,3 +189,21 @@ class PaymentTransactionRepository:
 
         row = result.mappings().first()
         return dict(row) if row else None
+
+    async def get_by_receipt_for_update(
+        self,
+        *,
+        mpesa_receipt_number: str,
+        landlord_id: str,
+    ) -> PaymentTransaction | None:
+        """Load and lock a payment transaction within one landlord scope."""
+        result = await self.db.execute(
+            select(PaymentTransaction)
+            .where(
+                PaymentTransaction.mpesa_receipt_number == mpesa_receipt_number,
+                PaymentTransaction.landlord_id == landlord_id,
+            )
+            .with_for_update()
+            .limit(1)
+        )
+        return result.scalar_one_or_none()

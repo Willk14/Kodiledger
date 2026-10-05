@@ -79,7 +79,17 @@ class OutboxEventRepository:
         self,
         *,
         limit: int = 100,
+        lock_timeout_seconds: int = 300,
     ) -> list[dict[str, Any]]:
+        stale_before = func.now() - func.make_interval(
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            lock_timeout_seconds,
+        )
         candidates = (
             await self.db.scalars(
                 select(OutboxEvent)
@@ -88,13 +98,10 @@ class OutboxEventRepository:
                     OutboxEvent.available_at <= func.now(),
                     (
                         (OutboxEvent.locked_at.is_(None))
-                        | (
-                            OutboxEvent.locked_at
-                            < func.now() - func.make_interval(0, 0, 0, 0, 0, 5, 0)
-                        )
+                        | (OutboxEvent.locked_at < stale_before)
                     ),
                 )
-                .order_by(OutboxEvent.created_at)
+                .order_by(OutboxEvent.created_at, OutboxEvent.id)
                 .with_for_update(skip_locked=True)
                 .limit(limit)
             )
@@ -104,6 +111,11 @@ class OutboxEventRepository:
             return []
 
         event_ids = [event.id for event in candidates]
+        stale_event_ids = {
+            event.id
+            for event in candidates
+            if event.locked_at is not None
+        }
 
         result = await self.db.execute(
             update(OutboxEvent)
@@ -112,9 +124,16 @@ class OutboxEventRepository:
             .returning(OutboxEvent)
         )
 
-        claimed = result.scalars().all()
-
-        return [self._to_dict(event) for event in claimed]
+        claimed_by_id = {event.id: event for event in result.scalars().all()}
+        claimed_events = []
+        for event_id in event_ids:
+            event = claimed_by_id.get(event_id)
+            if event is None:
+                continue
+            event_dict = self._to_dict(event)
+            event_dict["_stale_lock_reclaimed"] = event.id in stale_event_ids
+            claimed_events.append(event_dict)
+        return claimed_events
 
     async def mark_published(
         self,
@@ -170,6 +189,3 @@ class OutboxEventRepository:
                 locked_at=None,
             )
         )
-
-
-        

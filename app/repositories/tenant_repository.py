@@ -1,5 +1,10 @@
-from sqlalchemy import text
+from uuid import UUID
+
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.tenant import Tenant
+from app.models.unit import Unit
 
 
 class TenantRepository:
@@ -9,6 +14,67 @@ class TenantRepository:
 
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
+
+    async def list_by_landlord(self, landlord_id: UUID) -> list[Tenant]:
+        result = await self.db.execute(
+            select(Tenant)
+            .where(Tenant.landlord_id == landlord_id)
+            .order_by(Tenant.created_at.asc(), Tenant.id.asc())
+        )
+        return list(result.scalars().all())
+
+    async def get_by_id_and_landlord(
+        self, tenant_id: UUID, landlord_id: UUID
+    ) -> Tenant | None:
+        result = await self.db.execute(
+            select(Tenant).where(
+                Tenant.id == tenant_id,
+                Tenant.landlord_id == landlord_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def get_active_scope_by_id_and_landlord(
+        self,
+        *,
+        tenant_id: UUID,
+        landlord_id: UUID,
+    ) -> dict | None:
+        result = await self.db.execute(
+            select(Tenant.id, Tenant.landlord_id, Tenant.unit_id).where(
+                Tenant.id == tenant_id,
+                Tenant.landlord_id == landlord_id,
+                Tenant.is_active.is_(True),
+            )
+        )
+        row = result.mappings().first()
+        return dict(row) if row else None
+
+    async def create_for_unit(
+        self,
+        *,
+        landlord_id: UUID,
+        unit_id: UUID,
+        values: dict[str, object],
+    ) -> Tenant | None:
+        result = await self.db.execute(
+            select(Unit)
+            .where(Unit.id == unit_id, Unit.landlord_id == landlord_id)
+        )
+        unit = result.scalar_one_or_none()
+        if unit is None:
+            return None
+
+        tenant = Tenant(
+            landlord_id=landlord_id,
+            unit_id=unit_id,
+            **values,
+        )
+        self.db.add(tenant)
+        await self.db.flush()
+        await self.db.refresh(tenant)
+        await self.db.commit()
+        return tenant
 
     async def get_active_by_phone(
         self,
@@ -49,4 +115,3 @@ class TenantRepository:
             return None
 
         return dict(tenant)
-    

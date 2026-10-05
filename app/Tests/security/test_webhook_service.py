@@ -99,6 +99,10 @@ async def test_reconciliation_failure_rolls_back_and_releases_redis_lock():
 
     reconciliation_service.reconcile_payment.assert_awaited_once()
 
-    db.commit.assert_not_awaited()
+    assert db.commit.await_count == 2
+    webhook_repository.schedule_retry.assert_awaited_once_with(
+        "raw-webhook-id",
+        "forced reconciliation failure",
+        delay_seconds=30,
+    )
 
-    

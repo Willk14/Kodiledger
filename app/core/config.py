@@ -52,6 +52,12 @@ class Settings(BaseSettings):
 
     MPESA_BASE_URL: str = "https://sandbox.safaricom.co.ke"
     MPESA_CALLBACK_URL: str
+    MPESA_CALLBACK_ALLOWED_IPS: str = (
+        "196.201.214.200,196.201.214.206,196.201.213.114,196.201.214.207,"
+        "196.201.214.208,196.201.213.44,196.201.212.127,196.201.212.138,"
+        "196.201.212.129,196.201.212.136,196.201.212.74,196.201.212.69"
+    )
+    MPESA_CALLBACK_TOKEN: str = ""
 
     # ============================================================
     # CORS
@@ -63,9 +69,11 @@ class Settings(BaseSettings):
     # Authentication / Security
     # ============================================================
 
-    JWT_SECRET_KEY: str = ""
-    JWT_ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    OIDC_ISSUER_URL: str = ""
+    OIDC_AUDIENCE: str = ""
+    OIDC_JWKS_URL: str = ""
+    OIDC_SIGNING_ALGORITHMS: str = "RS256"
+    OIDC_JWKS_TIMEOUT_SECONDS: int = Field(default=5, ge=1, le=30)
 
     # ============================================================
     # Environment configuration
@@ -80,6 +88,15 @@ class Settings(BaseSettings):
 
     KAFKA_BOOTSTRAP_SERVERS: str = "127.0.0.1:9092"
     KAFKA_PAYMENT_TOPIC: str = "payment.processed"
+
+    # ============================================================
+    # Transactional outbox delivery
+    # ============================================================
+
+    OUTBOX_BATCH_SIZE: int = Field(default=100, ge=1, le=1000)
+    OUTBOX_MAX_BATCH_WAIT_MS: int = Field(default=1000, ge=0, le=60_000)
+    OUTBOX_POLL_INTERVAL_MS: int = Field(default=500, ge=1, le=60_000)
+    OUTBOX_LOCK_TIMEOUT_SECONDS: int = Field(default=300, ge=1, le=86_400)
 
 
 settings = Settings()

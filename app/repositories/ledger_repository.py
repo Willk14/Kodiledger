@@ -13,6 +13,58 @@ class LedgerRepository:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
 
+    async def list_by_landlord(self, landlord_id: str) -> list:
+        from app.models.ledger_entry import LedgerEntry
+
+        result = await self.db.execute(
+            select(LedgerEntry)
+            .where(LedgerEntry.landlord_id == landlord_id)
+            .order_by(LedgerEntry.created_at.desc(), LedgerEntry.id.desc())
+        )
+        return list(result.scalars().all())
+
+    async def get_by_id_and_landlord(
+        self,
+        *,
+        entry_id: str,
+        landlord_id: str,
+    ):
+        from app.models.ledger_entry import LedgerEntry
+
+        result = await self.db.execute(
+            select(LedgerEntry).where(
+                LedgerEntry.id == entry_id,
+                LedgerEntry.landlord_id == landlord_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def list_by_landlord(self, landlord_id: str) -> list:
+        from app.models.ledger_entry import LedgerEntry
+
+        result = await self.db.execute(
+            select(LedgerEntry)
+            .where(LedgerEntry.landlord_id == landlord_id)
+            .order_by(LedgerEntry.created_at.desc(), LedgerEntry.id.desc())
+        )
+        return list(result.scalars().all())
+
+    async def get_by_id_and_landlord(
+        self,
+        *,
+        entry_id: str,
+        landlord_id: str,
+    ):
+        from app.models.ledger_entry import LedgerEntry
+
+        result = await self.db.execute(
+            select(LedgerEntry).where(
+                LedgerEntry.id == entry_id,
+                LedgerEntry.landlord_id == landlord_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
     async def create_credit(
         self,
         landlord_id: str,

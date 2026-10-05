@@ -63,6 +63,26 @@ class RawPaymentWebhook(Base):
         Text,
     )
 
+    attempt_count: Mapped[int] = mapped_column(
+        default=0,
+        server_default="0",
+        nullable=False,
+    )
+
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default="CURRENT_TIMESTAMP",
+        nullable=False,
+    )
+
+    locked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+    )
+
+    retry_exhausted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+    )
+
     created_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         server_default="CURRENT_TIMESTAMP",

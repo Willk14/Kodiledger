@@ -81,6 +81,7 @@ async def _clean_webhook_test_data(db: AsyncSession) -> None:
     await db.execute(text("DELETE FROM payment_transactions WHERE mpesa_receipt_number LIKE 'IT-%'"))
     await db.execute(text("DELETE FROM payment_processing WHERE mpesa_receipt_number LIKE 'IT-%'"))
     await db.execute(text("DELETE FROM raw_payment_webhooks WHERE mpesa_receipt_number LIKE 'IT-%' OR merchant_request_id LIKE 'IT-%'"))
+    await db.execute(text("DELETE FROM stk_push_requests WHERE checkout_request_id LIKE 'IT-%'"))
     await db.execute(text("DELETE FROM invoices WHERE invoice_number LIKE 'IT-%'"))
     await db.commit()
 
@@ -171,6 +172,67 @@ def callback_payload(receipt: str, merchant: str, checkout: str, amount: int):
     }
 
 
+async def _record_stk_request(merchant_request_id: str, checkout_request_id: str) -> None:
+    """Seed a successful Daraja STK initiation before its callback arrives."""
+    async with TestSystemSessionLocal() as db:
+        await db.execute(
+            text("""
+                INSERT INTO stk_push_requests (merchant_request_id, checkout_request_id)
+                VALUES (:merchant, :checkout)
+                ON CONFLICT (checkout_request_id) DO NOTHING
+            """),
+            {"merchant": merchant_request_id, "checkout": checkout_request_id},
+        )
+        await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_callback_with_mismatched_stk_identifiers_is_rejected_before_inbox():
+    suffix = uuid4().hex[:12]
+    merchant = f"IT-TRUSTED-MERCHANT-{suffix}"
+    checkout = f"IT-TRUSTED-CHECKOUT-{suffix}"
+    receipt = f"IT-UNTRUSTED-RECEIPT-{suffix}"
+    await _record_stk_request(merchant, checkout)
+
+    async with _webhook_client() as client:
+        response = await client.post(
+            WEBHOOK_URL,
+            json=callback_payload(
+                receipt,
+                f"IT-FORGED-MERCHANT-{suffix}",
+                checkout,
+                150,
+            ),
+        )
+
+    assert response.status_code == 401
+
+    async with TestSystemSessionLocal() as db:
+        inbox_count = await db.scalar(
+            text("""
+                SELECT count(*) FROM raw_payment_webhooks
+                WHERE merchant_request_id = :merchant
+                   OR mpesa_receipt_number = :receipt
+            """),
+            {"merchant": f"IT-FORGED-MERCHANT-{suffix}", "receipt": receipt},
+        )
+        request_status = await db.scalar(
+            text("""
+                SELECT request_status FROM stk_push_requests
+                WHERE checkout_request_id = :checkout
+            """),
+            {"checkout": checkout},
+        )
+        assert inbox_count == 0
+        assert request_status == "PENDING"
+        await db.execute(
+            text("DELETE FROM stk_push_requests WHERE checkout_request_id = :checkout"),
+            {"checkout": checkout},
+        )
+        await db.commit()
+
+
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_matched_webhook_is_idempotent():
@@ -230,6 +292,7 @@ async def test_matched_webhook_is_idempotent():
         await db.commit()
 
     try:
+        await _record_stk_request(merchant, checkout)
         async with _webhook_client() as client:
             first = await client.post(
                 WEBHOOK_URL,
@@ -463,6 +526,8 @@ async def test_successful_webhook_creates_unassigned_payment():
     unmatched_phone = "254700000001"
     amount = 250
 
+    await _record_stk_request(merchant, checkout)
+
     async with _webhook_client() as client:
         response = await client.post(
             WEBHOOK_URL,
@@ -659,6 +724,7 @@ async def test_failed_webhook_is_audited_without_financial_processing():
     result_desc = "Request cancelled by user"
 
     try:
+        await _record_stk_request(merchant, checkout)
         async with _webhook_client() as client:
             response = await client.post(
                 WEBHOOK_URL,
@@ -848,6 +914,7 @@ async def test_concurrent_duplicate_webhooks_create_one_financial_chain():
         checkout,
         amount,
     )
+    await _record_stk_request(merchant, checkout)
 
     try:
         async with _webhook_client() as client:
@@ -1141,6 +1208,8 @@ async def test_overpayment_allocates_invoice_and_creates_payment_credit():
     expected_credit = 50
 
     invoice_id = None
+
+    await _record_stk_request(merchant, checkout)
 
     async with TestSystemSessionLocal() as db:
         result = await db.execute(
@@ -1507,6 +1576,8 @@ async def test_partial_payment_allocates_invoice_without_payment_credit():
     invoice_id = None
     transaction_id = None
 
+    await _record_stk_request(merchant, checkout)
+
     async with TestSystemSessionLocal() as db:
         result = await db.execute(
             text(
@@ -1864,6 +1935,8 @@ async def test_exact_payment_fully_allocates_invoice_without_payment_credit():
 
     invoice_id = None
     transaction_id = None
+
+    await _record_stk_request(merchant, checkout)
 
     async with TestSystemSessionLocal() as db:
         result = await db.execute(
@@ -2289,6 +2362,8 @@ async def test_concurrent_different_payments_cannot_overallocate_same_invoice():
         checkout_b,
         payment_amount,
     )
+    await _record_stk_request(merchant_a, checkout_a)
+    await _record_stk_request(merchant_b, checkout_b)
 
     async def send_payment(payload):
         async with _webhook_client() as client:
@@ -3449,3 +3524,252 @@ async def test_outbox_worker_reclaims_stale_locked_event():
                 {"event_id": event_id},
             )
             await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_outbox_claim_respects_batch_limit_and_deterministic_order():
+    idempotency_keys = [
+        f"IT-OUTBOX-BATCH-LIMIT-{uuid4().hex}" for _ in range(3)
+    ]
+    event_ids = []
+
+    try:
+        async with TestSystemSessionLocal() as db:
+            for idempotency_key in idempotency_keys:
+                event_id = await db.scalar(
+                    text(
+                        """
+                        INSERT INTO outbox_events (
+                            event_type, aggregate_type, aggregate_id,
+                            idempotency_key, payload, status, available_at,
+                            created_at
+                        )
+                        VALUES (
+                            'TEST_EVENT', 'TEST_AGGREGATE', gen_random_uuid(),
+                            :idempotency_key, '{"test": true}'::jsonb,
+                            'PENDING', CURRENT_TIMESTAMP - INTERVAL '1 day',
+                            CURRENT_TIMESTAMP - INTERVAL '100 days'
+                        )
+                        RETURNING id
+                        """
+                    ),
+                    {"idempotency_key": idempotency_key},
+                )
+                event_ids.append(event_id)
+            await db.commit()
+
+        async with TestSystemSessionLocal() as db:
+            claimed = await OutboxEventRepository(db).claim_pending(
+                limit=2,
+                lock_timeout_seconds=settings.OUTBOX_LOCK_TIMEOUT_SECONDS,
+            )
+            claimed_target_ids = [
+                event["id"] for event in claimed if event["id"] in event_ids
+            ]
+            assert len(claimed) <= 2
+            assert len(claimed_target_ids) == 2
+            assert claimed_target_ids == sorted(event_ids)[:2]
+            await db.commit()
+    finally:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text("DELETE FROM outbox_events WHERE id = ANY(:event_ids)"),
+                {"event_ids": event_ids},
+            )
+            await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_outbox_worker_records_partial_batch_results_independently():
+    idempotency_keys = [
+        f"IT-OUTBOX-PARTIAL-BATCH-{uuid4().hex}" for _ in range(3)
+    ]
+    event_ids = []
+
+    try:
+        async with TestSystemSessionLocal() as db:
+            for idempotency_key in idempotency_keys:
+                event_id = await db.scalar(
+                    text(
+                        """
+                        INSERT INTO outbox_events (
+                            event_type, aggregate_type, aggregate_id,
+                            idempotency_key, payload, status, available_at,
+                            created_at
+                        )
+                        VALUES (
+                            'TEST_EVENT', 'TEST_AGGREGATE', gen_random_uuid(),
+                            :idempotency_key, '{"test": true}'::jsonb,
+                            'PENDING', CURRENT_TIMESTAMP,
+                            CURRENT_TIMESTAMP - INTERVAL '100 days'
+                        )
+                        RETURNING id
+                        """
+                    ),
+                    {"idempotency_key": idempotency_key},
+                )
+                event_ids.append(event_id)
+            await db.commit()
+
+        publisher = TestEventPublisher()
+        original_publish = publisher.publish
+
+        async def fail_one_event(event):
+            if event["idempotency_key"] == idempotency_keys[1]:
+                raise RuntimeError("simulated single-event failure")
+            await original_publish(event)
+
+        publisher.publish = fail_one_event
+        worker = OutboxWorker(
+            TestSystemSessionLocal,
+            publisher,
+            batch_size=3,
+            lock_timeout_seconds=settings.OUTBOX_LOCK_TIMEOUT_SECONDS,
+        )
+
+        processed = await worker.run_once()
+
+        assert processed == 2
+        assert len(publisher.published_events) == 2
+        assert all(
+            "_stale_lock_reclaimed" not in event
+            for event in publisher.published_events
+        )
+        async with TestSystemSessionLocal() as db:
+            rows = {}
+            for event_id in event_ids:
+                rows[event_id] = (
+                    await db.execute(
+                        text(
+                            """
+                            SELECT status, attempts, locked_at, idempotency_key
+                            FROM outbox_events WHERE id = :event_id
+                            """
+                        ),
+                        {"event_id": event_id},
+                    )
+                ).mappings().one()
+
+            for index, event_id in enumerate(event_ids):
+                if index == 1:
+                    assert rows[event_id]["status"] == "PENDING"
+                    assert rows[event_id]["attempts"] == 1
+                else:
+                    assert rows[event_id]["status"] == "PUBLISHED"
+                    assert rows[event_id]["attempts"] == 0
+                assert rows[event_id]["locked_at"] is None
+                assert rows[event_id]["idempotency_key"] == idempotency_keys[index]
+    finally:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text("DELETE FROM outbox_events WHERE id = ANY(:event_ids)"),
+                {"event_ids": event_ids},
+            )
+            await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_outbox_worker_recovers_crash_after_publish_before_state_update():
+    idempotency_key = f"IT-OUTBOX-CRASH-RESTART-{uuid4().hex}"
+    event_id = None
+
+    try:
+        async with TestSystemSessionLocal() as db:
+            event_id = await db.scalar(
+                text(
+                    """
+                    INSERT INTO outbox_events (
+                        event_type, aggregate_type, aggregate_id,
+                        idempotency_key, payload, status, available_at,
+                        created_at
+                    )
+                    VALUES (
+                        'TEST_EVENT', 'TEST_AGGREGATE', gen_random_uuid(),
+                        :idempotency_key, '{"test": true}'::jsonb,
+                        'PENDING', CURRENT_TIMESTAMP,
+                        CURRENT_TIMESTAMP - INTERVAL '200 days'
+                    )
+                    RETURNING id
+                    """
+                ),
+                {"idempotency_key": idempotency_key},
+            )
+            await db.commit()
+
+        # Simulate a worker claiming and publishing the row, then crashing
+        # before it records the Kafka acknowledgement in PostgreSQL.
+        async with TestSystemSessionLocal() as db:
+            claimed = await OutboxEventRepository(db).claim_pending(limit=1)
+            claimed_event = next(
+                (event for event in claimed if event["id"] == event_id),
+                None,
+            )
+            assert claimed_event is not None
+            await db.commit()
+
+        first_delivery = TestEventPublisher()
+        await first_delivery.publish(
+            {
+                key: value
+                for key, value in claimed_event.items()
+                if not key.startswith("_")
+            }
+        )
+
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    UPDATE outbox_events
+                    SET locked_at = CURRENT_TIMESTAMP
+                        - make_interval(secs => :stale_seconds)
+                    WHERE id = :event_id
+                    """
+                ),
+                {
+                    "event_id": event_id,
+                    "stale_seconds": settings.OUTBOX_LOCK_TIMEOUT_SECONDS + 1,
+                },
+            )
+            await db.commit()
+
+        restarted_publisher = TestEventPublisher()
+        worker = OutboxWorker(
+            TestSystemSessionLocal,
+            restarted_publisher,
+            batch_size=1,
+            lock_timeout_seconds=settings.OUTBOX_LOCK_TIMEOUT_SECONDS,
+        )
+        assert await worker.run_once() == 1
+
+        assert first_delivery.published_events[0]["id"] == event_id
+        redelivered = restarted_publisher.published_events[0]
+        assert redelivered["id"] == event_id
+        assert redelivered["idempotency_key"] == idempotency_key
+
+        async with TestSystemSessionLocal() as db:
+            row = (
+                await db.execute(
+                    text(
+                        """
+                        SELECT status, attempts, locked_at
+                        FROM outbox_events WHERE id = :event_id
+                        """
+                    ),
+                    {"event_id": event_id},
+                )
+            ).mappings().one()
+            assert row["status"] == "PUBLISHED"
+            assert row["attempts"] == 0
+            assert row["locked_at"] is None
+    finally:
+        if event_id is not None:
+            async with TestSystemSessionLocal() as db:
+                await db.execute(
+                    text("DELETE FROM outbox_events WHERE id = :event_id"),
+                    {"event_id": event_id},
+                )
+                await db.commit()

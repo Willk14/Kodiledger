@@ -10,9 +10,14 @@ from app.repositories.payment_processing_repository import (
     PaymentProcessingRepository,
 )
 from app.repositories.webhook_repository import WebhookRepository
+from app.repositories.stk_push_request_repository import StkPushRequestRepository
 
 from app.services.idempotency_service import IdempotencyService
 from app.services.reconciliation_service import ReconciliationService
+
+
+class UnmatchedStkCallback(ValueError):
+    """Raised when callback IDs do not identify an initiated STK request."""
 
 
 class WebhookService:
@@ -58,6 +63,10 @@ class WebhookService:
         self,
         payload: Any,
         db,
+        *,
+        raw_webhook_id: str | None = None,
+        persist_inbox: bool = True,
+        retry_delay_seconds: int = 30,
     ) -> dict[str, Any]:
         """
         Process an M-Pesa STK callback.
@@ -85,9 +94,19 @@ class WebhookService:
             result_code = stk_data.ResultCode
             result_desc = stk_data.ResultDesc
 
-            receipt, amount, phone = self._extract_payment_metadata(
-                stk_data
-            )
+            # Only callbacks correlated to a request created from Daraja's
+            # successful STK initiation response may enter the durable inbox.
+            # Replays are already trusted inbox records and bypass this gate.
+            if persist_inbox:
+                matched_request = await StkPushRequestRepository(
+                    db
+                ).mark_callback_received(
+                    merchant_request_id, checkout_request_id
+                )
+                if not matched_request:
+                    raise UnmatchedStkCallback(
+                        "Callback does not match an initiated STK request."
+                    )
 
             # ====================================================
             # 2. Persist the raw webhook
@@ -97,20 +116,35 @@ class WebhookService:
                 mode="json"
             )
 
-            raw_webhook_id = (
-                await self.webhook_repository.create_raw_webhook(
+            if persist_inbox:
+                raw_webhook_id = await self.webhook_repository.create_raw_webhook(
                     merchant_request_id=merchant_request_id,
                     checkout_request_id=checkout_request_id,
-                    receipt=receipt,
+                    receipt=None,
                     raw_payload=raw_payload,
                 )
+
+            if persist_inbox:
+                # The inbox is committed before financial processing so a
+                # crash or rollback cannot erase the provider's callback.
+                await db.commit()
+
+            receipt, amount, phone = self._extract_payment_metadata(
+                stk_data
             )
+            if raw_webhook_id and receipt:
+                await self.webhook_repository.record_receipt(
+                    raw_webhook_id,
+                    receipt,
+                )
 
             # ====================================================
             # 3. Handle failed M-Pesa transaction
             # ====================================================
 
             if result_code != 0:
+                if raw_webhook_id:
+                    await self.webhook_repository.mark_processed(raw_webhook_id)
                 await db.commit()
 
                 return {
@@ -184,6 +218,8 @@ class WebhookService:
                 )
 
                 if already_exists:
+                    if raw_webhook_id:
+                        await self.webhook_repository.mark_processed(raw_webhook_id)
                     await db.commit()
 
                     return {
@@ -210,6 +246,8 @@ class WebhookService:
             )
 
             if not claimed:
+                if raw_webhook_id:
+                    await self.webhook_repository.mark_processed(raw_webhook_id)
                 await db.commit()
 
                 return {
@@ -255,6 +293,9 @@ class WebhookService:
                 status=processing_status,
             )
 
+            if raw_webhook_id:
+                await self.webhook_repository.mark_processed(raw_webhook_id)
+
             # ====================================================
             # 10. Commit atomic transaction
             # ====================================================
@@ -275,12 +316,31 @@ class WebhookService:
                 "reconciliation": reconciliation,
             }
 
+        except UnmatchedStkCallback:
+            # This is an untrusted callback, not a transient processing
+            # failure. Do not save it to the retryable inbox.
+            await db.rollback()
+            raise
+
         except Exception as exc:
             # ====================================================
             # 11. Roll back database transaction
             # ====================================================
 
             await db.rollback()
+
+            # Keep the already committed inbox row and schedule an internal
+            # retry after rolling back all financial writes.
+            if raw_webhook_id:
+                try:
+                    await self.webhook_repository.schedule_retry(
+                        raw_webhook_id,
+                        str(exc),
+                        delay_seconds=retry_delay_seconds,
+                    )
+                    await db.commit()
+                except Exception:
+                    await db.rollback()
 
             # ====================================================
             # 12. Release Redis lock
@@ -371,4 +431,3 @@ class WebhookService:
 
         return receipt, amount, phone
 
-    

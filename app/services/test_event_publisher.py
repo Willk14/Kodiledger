@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.services.event_publisher import EventPublisher
 
-class TestEventPublisher:
+
+class TestEventPublisher(EventPublisher):
     __test__ = False
     def __init__(self) -> None:
         self.published_events: list[dict[str, Any]] = []

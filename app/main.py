@@ -5,6 +5,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1.endpoints.webhooks import router as webhooks_router
 from app.api.v1.endpoints.payments import router as payments_router
+from app.api.v1.endpoints.properties import router as properties_router
+from app.api.v1.endpoints.units import router as units_router
+from app.api.v1.endpoints.tenants import router as tenants_router
+from app.api.v1.endpoints.invoices import router as invoices_router
+from app.api.v1.endpoints.unassigned_payments import router as unassigned_payments_router
+from app.api.v1.endpoints.ledger import router as ledger_router
 from app.api.v1.endpoints.Bff.landlord import (
     router as landlord_bff_router,
 )
@@ -61,6 +67,36 @@ app.include_router(
     payments_router,
     prefix="/api/v1",
     tags=["Payments"],
+)
+
+app.include_router(
+    properties_router,
+    prefix="/api/v1",
+)
+
+app.include_router(
+    units_router,
+    prefix="/api/v1",
+)
+
+app.include_router(
+    tenants_router,
+    prefix="/api/v1",
+)
+
+app.include_router(
+    invoices_router,
+    prefix="/api/v1",
+)
+
+app.include_router(
+    unassigned_payments_router,
+    prefix="/api/v1",
+)
+
+app.include_router(
+    ledger_router,
+    prefix="/api/v1",
 )
 
 app.include_router(

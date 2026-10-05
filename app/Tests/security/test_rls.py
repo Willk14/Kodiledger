@@ -39,6 +39,8 @@ async def test_set_rls_context_sets_landlord_user_and_role():
     )
     assert params["user_id"] == "landlord-user"
     assert params["role"] == "LANDLORD"
+    assert "set_config" in statement_text
+    assert statement_text.count("true") == 3
 
 
 @pytest.mark.asyncio
@@ -61,5 +63,3 @@ async def test_set_rls_context_allows_principal_without_landlord_id():
     assert params["landlord_id"] == ""
     assert params["user_id"] == "system-user"
     assert params["role"] == "SYSTEM"
-
-    

@@ -377,8 +377,11 @@ System-level database operations
 This separation is important because a single unrestricted database role would
 weaken tenant isolation.
 
-The exact authenticated-to-RLS context propagation is a Phase 3 requirement and
-must be connected to the future authentication/RBAC implementation.
+The landlord BFF currently resolves an OIDC subject to a trusted local user
+membership, then sets landlord, user, and role settings transaction-locally
+through `get_rls_db()`. This is a narrow Phase 3 integration point; business
+routes do not yet broadly use it, and PostgreSQL-backed cross-landlord tests
+have not established end-to-end isolation.
 7. Multi-Tenancy
 
 KodiLedger is designed as a multi-tenant application.
@@ -790,6 +793,24 @@ Database commit ✅
 Kafka publish ❌
 
 without a durable record that the event still needs to be published.
+
+The worker treats batching as a delivery optimization. It claims at most
+`OUTBOX_BATCH_SIZE` rows in deterministic `(created_at, id)` order using
+`FOR UPDATE SKIP LOCKED`, then commits the claim before Kafka network I/O. The
+Kafka producer sends events concurrently and uses `OUTBOX_MAX_BATCH_WAIT_MS` as
+its linger bound, allowing Kafka to group records while keeping low-volume
+delivery latency bounded. The worker records each publish result in a separate
+database transaction, so one failed event does not roll back successful
+neighbors or combine their financial transactions.
+
+The worker polls at `OUTBOX_POLL_INTERVAL_MS` and may reclaim a pending claim
+after `OUTBOX_LOCK_TIMEOUT_SECONDS` (300 seconds by default). Each failed event
+retains its own retry counter and exponential backoff; after five total failed
+attempts it is marked `FAILED`. PostgreSQL remains authoritative for event
+identity, idempotency, and delivery state. A crash after Kafka accepts an event
+but before PostgreSQL records `PUBLISHED` can still cause redelivery, so this
+remains at-least-once delivery and consumers must deduplicate by event identity
+or idempotency key.
 19. Outbox Idempotency
 
 Outbox insertion uses an idempotency key.

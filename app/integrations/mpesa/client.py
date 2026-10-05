@@ -5,6 +5,7 @@ import base64
 import time
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 
@@ -137,6 +138,35 @@ class MpesaClient:
             raise RuntimeError(
                 "MPESA_CALLBACK_URL is not configured."
             )
+
+        if settings.ENVIRONMENT.strip().lower() not in {"development", "test"}:
+            if len(settings.MPESA_CALLBACK_TOKEN) < 32:
+                raise RuntimeError(
+                    "MPESA_CALLBACK_TOKEN must contain at least 32 characters "
+                    "outside development and test."
+                )
+            if urlsplit(self.callback_url).scheme.lower() != "https":
+                raise RuntimeError(
+                    "MPESA_CALLBACK_URL must use HTTPS outside development and test."
+                )
+
+    def _callback_url_with_token(self) -> str:
+        """Add the configured bearer token without exposing it in code or logs."""
+        callback_url = self.callback_url
+        callback_token = settings.MPESA_CALLBACK_TOKEN
+        if not callback_token:
+            return callback_url
+
+        parts = urlsplit(callback_url)
+        query = [
+            (key, value)
+            for key, value in parse_qsl(parts.query, keep_blank_values=True)
+            if key != "token"
+        ]
+        query.append(("token", callback_token))
+        return urlunsplit(
+            (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
+        )
 
     # ------------------------------------------------------------------
     # OAuth cache
@@ -342,7 +372,7 @@ class MpesaClient:
             "PartyA": phone_number,
             "PartyB": self.shortcode,
             "PhoneNumber": phone_number,
-            "CallBackURL": self.callback_url,
+            "CallBackURL": self._callback_url_with_token(),
             "AccountReference": account_reference,
             "TransactionDesc": transaction_description,
         }
@@ -428,6 +458,45 @@ class MpesaClient:
             flush=True,
         )
 
+        return data
+
+    async def query_stk_push(self, checkout_request_id: str) -> dict[str, Any]:
+        """Query a previously accepted STK request by its checkout ID."""
+        self._validate_credentials()
+        if not checkout_request_id.strip():
+            raise ValueError("CheckoutRequestID is required.")
+
+        access_token = await self.get_access_token()
+        timestamp = self.generate_timestamp()
+        payload = {
+            "BusinessShortCode": self.shortcode,
+            "Password": self.generate_password(timestamp),
+            "Timestamp": timestamp,
+            "CheckoutRequestID": checkout_request_id,
+        }
+        client = await self._get_http_client()
+        try:
+            response = await client.post(
+                f"{self.base_url}/mpesa/stkpushquery/v1/query",
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                },
+            )
+        except httpx.HTTPError as exc:
+            raise RuntimeError("Daraja STK status query failed.") from exc
+
+        if response.status_code not in (200, 201):
+            raise RuntimeError(
+                f"Daraja STK status query failed: HTTP {response.status_code}"
+            )
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise RuntimeError("Daraja STK status query returned invalid JSON.") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError("Daraja STK status query returned an invalid response.")
         return data
 
 

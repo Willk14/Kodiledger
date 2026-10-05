@@ -266,6 +266,11 @@ async def test_authenticated_oidc_request_resolves_membership_and_enforces_rls(
                     "role": "ADMIN",
                 },
             )
+            properties_response = await client.get(
+                "/api/v1/properties",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"landlord_id": str(other_owner.landlord_id)},
+            )
     finally:
         if previous_override is None:
             api_app.dependency_overrides.pop(get_db, None)
@@ -274,11 +279,562 @@ async def test_authenticated_oidc_request_resolves_membership_and_enforces_rls(
 
     assert response.status_code == 200
     body = response.json()
+    assert set(body) == {"user_id", "role", "landlord_id", "property_count"}
     assert body["user_id"] == str(owner.user_id)
     assert body["role"] == "LANDLORD"
     assert body["landlord_id"] == str(owner.landlord_id)
     # Each landlord has one fixture property; without RLS the count would be two.
     assert body["property_count"] == 1
+    assert properties_response.status_code == 200
+    assert [row["id"] for row in properties_response.json()] == [
+        str(owner.property_id)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_property_api_lists_and_reads_only_authenticated_landlord_rows(
+    rls_database,
+):
+    owner = rls_database["a"]
+    other_owner = rls_database["b"]
+
+    async def override_get_db():
+        async with rls_database["sessions"]() as session:
+            yield session
+
+    previous_db = api_app.dependency_overrides.get(get_db)
+    previous_principal = api_app.dependency_overrides.get(get_current_principal)
+    api_app.dependency_overrides[get_db] = override_get_db
+    api_app.dependency_overrides[get_current_principal] = lambda: owner.principal
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=api_app),
+            base_url="http://test",
+        ) as client:
+            listing = await client.get("/api/v1/properties")
+            own_property = await client.get(
+                f"/api/v1/properties/{owner.property_id}"
+            )
+            foreign_property = await client.get(
+                f"/api/v1/properties/{other_owner.property_id}"
+            )
+            invalid_id = await client.get("/api/v1/properties/not-a-uuid")
+    finally:
+        if previous_db is None:
+            api_app.dependency_overrides.pop(get_db, None)
+        else:
+            api_app.dependency_overrides[get_db] = previous_db
+        if previous_principal is None:
+            api_app.dependency_overrides.pop(get_current_principal, None)
+        else:
+            api_app.dependency_overrides[get_current_principal] = previous_principal
+
+    assert listing.status_code == 200
+    assert [item["id"] for item in listing.json()] == [str(owner.property_id)]
+    assert set(listing.json()[0]) == {
+        "id",
+        "name",
+        "county",
+        "town_location",
+        "total_units",
+        "created_at",
+    }
+    assert listing.json()[0]["name"] == "RLS Property 0"
+    assert own_property.status_code == 200
+    assert own_property.json()["id"] == str(owner.property_id)
+    assert foreign_property.status_code == 404
+    assert foreign_property.json() == {"detail": "Property not found."}
+    assert invalid_id.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_property_api_rejects_wrong_role_and_missing_bearer(rls_database):
+    owner = rls_database["a"]
+    tenant_principal = Principal(
+        user_id=str(uuid4()),
+        role=Role.TENANT,
+        landlord_id=str(owner.landlord_id),
+        tenant_id=str(owner.tenant_id),
+    )
+
+    async def override_get_db():
+        async with rls_database["sessions"]() as session:
+            yield session
+
+    previous_db = api_app.dependency_overrides.get(get_db)
+    previous_principal = api_app.dependency_overrides.get(get_current_principal)
+    api_app.dependency_overrides[get_db] = override_get_db
+    api_app.dependency_overrides[get_current_principal] = lambda: tenant_principal
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=api_app),
+            base_url="http://test",
+        ) as client:
+            forbidden = await client.get("/api/v1/properties")
+    finally:
+        if previous_db is None:
+            api_app.dependency_overrides.pop(get_db, None)
+        else:
+            api_app.dependency_overrides[get_db] = previous_db
+        if previous_principal is None:
+            api_app.dependency_overrides.pop(get_current_principal, None)
+        else:
+            api_app.dependency_overrides[get_current_principal] = previous_principal
+
+    api_app.dependency_overrides[get_db] = override_get_db
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=api_app),
+            base_url="http://test",
+        ) as client:
+            unauthenticated = await client.get("/api/v1/properties")
+    finally:
+        if previous_db is None:
+            api_app.dependency_overrides.pop(get_db, None)
+        else:
+            api_app.dependency_overrides[get_db] = previous_db
+
+    assert forbidden.status_code == 403
+    assert unauthenticated.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_unit_api_enforces_landlord_scope_and_supports_management(rls_database):
+    owner = rls_database["a"]
+    other_owner = rls_database["b"]
+    active_principal = owner.principal
+
+    async def override_get_db():
+        async with rls_database["sessions"]() as session:
+            yield session
+
+    previous_db = api_app.dependency_overrides.get(get_db)
+    previous_principal = api_app.dependency_overrides.get(get_current_principal)
+    api_app.dependency_overrides[get_db] = override_get_db
+    api_app.dependency_overrides[get_current_principal] = lambda: active_principal
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=api_app),
+            base_url="http://test",
+        ) as client:
+            listing = await client.get(
+                f"/api/v1/properties/{owner.property_id}/units"
+            )
+            own_unit = await client.get(f"/api/v1/units/{owner.unit_id}")
+            foreign_unit = await client.get(f"/api/v1/units/{other_owner.unit_id}")
+            foreign_owner_update = await client.patch(
+                f"/api/v1/units/{other_owner.unit_id}",
+                json={"base_rent": "1.00"},
+            )
+            created = await client.post(
+                f"/api/v1/properties/{owner.property_id}/units",
+                json={"unit_number": "B2", "base_rent": "1234.56"},
+            )
+            assert created.status_code == 201
+            unit_id = created.json()["id"]
+            property_after_create = await client.get(
+                f"/api/v1/properties/{owner.property_id}"
+            )
+            updated = await client.patch(
+                f"/api/v1/units/{unit_id}",
+                json={"base_rent": "1400.00"},
+            )
+            duplicate = await client.post(
+                f"/api/v1/properties/{owner.property_id}/units",
+                json={"unit_number": "B2", "base_rent": "1500.00"},
+            )
+            property_after_conflict = await client.get(
+                f"/api/v1/properties/{owner.property_id}"
+            )
+            foreign_property_create = await client.post(
+                f"/api/v1/properties/{other_owner.property_id}/units",
+                json={"unit_number": "B2", "base_rent": "1500.00"},
+            )
+            active_principal = other_owner.principal
+            foreign_owner_read = await client.get(f"/api/v1/units/{unit_id}")
+            foreign_owner_update = await client.patch(
+                f"/api/v1/units/{unit_id}",
+                json={"base_rent": "1.00"},
+            )
+    finally:
+        if previous_db is None:
+            api_app.dependency_overrides.pop(get_db, None)
+        else:
+            api_app.dependency_overrides[get_db] = previous_db
+        if previous_principal is None:
+            api_app.dependency_overrides.pop(get_current_principal, None)
+        else:
+            api_app.dependency_overrides[get_current_principal] = previous_principal
+
+    assert listing.status_code == 200
+    assert [row["id"] for row in listing.json()] == [str(owner.unit_id)]
+    assert own_unit.status_code == 200
+    assert own_unit.json()["base_rent"] == "12000.00"
+    assert foreign_unit.status_code == 404
+    assert foreign_owner_update.status_code == 404
+    assert updated.status_code == 200
+    assert updated.json()["base_rent"] == "1400.00"
+    assert property_after_create.status_code == 200
+    assert property_after_create.json()["total_units"] == 2
+    assert duplicate.status_code == 409
+    assert property_after_conflict.status_code == 200
+    assert property_after_conflict.json()["total_units"] == 2
+    assert foreign_property_create.status_code == 404
+    assert foreign_owner_read.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_unit_api_allows_caretaker_reads_but_denies_writes(rls_database):
+    owner = rls_database["a"]
+    caretaker = Principal(
+        user_id=str(uuid4()),
+        role=Role.CARETAKER,
+        landlord_id=str(owner.landlord_id),
+    )
+
+    async def override_get_db():
+        async with rls_database["sessions"]() as session:
+            yield session
+
+    previous_db = api_app.dependency_overrides.get(get_db)
+    previous_principal = api_app.dependency_overrides.get(get_current_principal)
+    api_app.dependency_overrides[get_db] = override_get_db
+    api_app.dependency_overrides[get_current_principal] = lambda: caretaker
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=api_app),
+            base_url="http://test",
+        ) as client:
+            listing = await client.get(
+                f"/api/v1/properties/{owner.property_id}/units"
+            )
+            write = await client.patch(
+                f"/api/v1/units/{owner.unit_id}",
+                json={"base_rent": "12500.00"},
+            )
+    finally:
+        if previous_db is None:
+            api_app.dependency_overrides.pop(get_db, None)
+        else:
+            api_app.dependency_overrides[get_db] = previous_db
+        if previous_principal is None:
+            api_app.dependency_overrides.pop(get_current_principal, None)
+        else:
+            api_app.dependency_overrides[get_current_principal] = previous_principal
+
+    assert listing.status_code == 200
+    assert [row["id"] for row in listing.json()] == [str(owner.unit_id)]
+    assert write.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_tenant_api_enforces_landlord_scope_and_tenant_self_scope(rls_database):
+    owner = rls_database["a"]
+    other_owner = rls_database["b"]
+    active_principal = owner.principal
+
+    async def override_get_db():
+        async with rls_database["sessions"]() as session:
+            yield session
+
+    previous_db = api_app.dependency_overrides.get(get_db)
+    previous_principal = api_app.dependency_overrides.get(get_current_principal)
+    api_app.dependency_overrides[get_db] = override_get_db
+    api_app.dependency_overrides[get_current_principal] = lambda: active_principal
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=api_app),
+            base_url="http://test",
+        ) as client:
+            listing = await client.get("/api/v1/tenants")
+            own_tenant = await client.get(f"/api/v1/tenants/{owner.tenant_id}")
+            foreign_tenant = await client.get(
+                f"/api/v1/tenants/{other_owner.tenant_id}"
+            )
+            created = await client.post(
+                "/api/v1/tenants",
+                json={
+                    "unit_id": str(owner.unit_id),
+                    "full_name": "  New   Tenant ",
+                    "primary_phone": "254712345678",
+                    "id_number": "ID-123",
+                    "lease_start_date": "2026-05-01",
+                    "deposit_amount": "15000.25",
+                },
+            )
+            occupied_unit = await client.get(f"/api/v1/units/{owner.unit_id}")
+            foreign_unit_create = await client.post(
+                "/api/v1/tenants",
+                json={
+                    "unit_id": str(other_owner.unit_id),
+                    "full_name": "Foreign Tenant",
+                    "primary_phone": "254712345679",
+                    "lease_start_date": "2026-05-01",
+                },
+            )
+            client_supplied_scope = await client.post(
+                "/api/v1/tenants",
+                json={
+                    "unit_id": str(owner.unit_id),
+                    "landlord_id": str(other_owner.landlord_id),
+                    "full_name": "Forged Scope Tenant",
+                    "primary_phone": "254712345681",
+                    "lease_start_date": "2026-05-01",
+                },
+            )
+            active_principal = Principal(
+                user_id=str(uuid4()),
+                role=Role.TENANT,
+                landlord_id=str(owner.landlord_id),
+                tenant_id=str(owner.tenant_id),
+            )
+            self_tenant = await client.get("/api/v1/tenants/me")
+            active_principal = Principal(
+                user_id=str(uuid4()),
+                role=Role.TENANT,
+                landlord_id=str(owner.landlord_id),
+                tenant_id=str(other_owner.tenant_id),
+            )
+            mismatched_self = await client.get("/api/v1/tenants/me")
+            active_principal = Principal(
+                user_id=str(uuid4()),
+                role=Role.CARETAKER,
+                landlord_id=str(owner.landlord_id),
+            )
+            caretaker_listing = await client.get("/api/v1/tenants")
+            caretaker_create = await client.post(
+                "/api/v1/tenants",
+                json={
+                    "unit_id": str(owner.unit_id),
+                    "full_name": "Denied Tenant",
+                    "primary_phone": "254712345680",
+                    "lease_start_date": "2026-05-01",
+                },
+            )
+    finally:
+        if previous_db is None:
+            api_app.dependency_overrides.pop(get_db, None)
+        else:
+            api_app.dependency_overrides[get_db] = previous_db
+        if previous_principal is None:
+            api_app.dependency_overrides.pop(get_current_principal, None)
+        else:
+            api_app.dependency_overrides[get_current_principal] = previous_principal
+
+    assert listing.status_code == 200
+    assert [row["id"] for row in listing.json()] == [str(owner.tenant_id)]
+    assert own_tenant.status_code == 200
+    assert foreign_tenant.status_code == 404
+    assert created.status_code == 201
+    assert created.json()["full_name"] == "New Tenant"
+    assert created.json()["deposit_amount"] == "15000.25"
+    assert "id_number" not in created.json()
+    assert occupied_unit.status_code == 200
+    assert occupied_unit.json()["is_occupied"] is False
+    assert foreign_unit_create.status_code == 404
+    assert client_supplied_scope.status_code == 422
+    assert self_tenant.status_code == 200
+    assert self_tenant.json()["id"] == str(owner.tenant_id)
+    assert mismatched_self.status_code == 404
+    assert caretaker_listing.status_code == 200
+    assert caretaker_create.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_invoice_api_enforces_landlord_rls_and_tenant_unit_consistency(rls_database):
+    owner = rls_database["a"]
+    other_owner = rls_database["b"]
+    alternate_unit_id = uuid4()
+    async with rls_database["admin_engine"].begin() as connection:
+        await connection.execute(
+            text(
+                """
+                INSERT INTO units (id, property_id, landlord_id, unit_number, base_rent)
+                VALUES (:id, :property_id, :landlord_id, 'A2', 12000)
+                """
+            ),
+            {
+                "id": alternate_unit_id,
+                "property_id": owner.property_id,
+                "landlord_id": owner.landlord_id,
+            },
+        )
+
+    async def override_get_db():
+        async with rls_database["sessions"]() as session:
+            yield session
+
+    previous_db = api_app.dependency_overrides.get(get_db)
+    previous_principal = api_app.dependency_overrides.get(get_current_principal)
+    api_app.dependency_overrides[get_db] = override_get_db
+    api_app.dependency_overrides[get_current_principal] = lambda: owner.principal
+
+    def payload(
+        unit_id: UUID,
+        tenant_id: UUID,
+        invoice_number: str,
+    ) -> dict[str, object]:
+        return {
+            "unit_id": str(unit_id),
+            "tenant_id": str(tenant_id),
+            "invoice_number": invoice_number,
+            "billing_month": "2026-10-01",
+            "rent_amount": "12000.00",
+            "water_amount": "30.00",
+            "garbage_amount": "50.00",
+            "security_amount": "60.00",
+            "due_date": "2026-10-05",
+        }
+
+    invoice_number = f"RLS-API-{uuid4()}"
+    valid_payload = payload(owner.unit_id, owner.tenant_id, invoice_number)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=api_app),
+            base_url="http://test",
+        ) as client:
+            created = await client.post("/api/v1/invoices", json=valid_payload)
+            listing = await client.get("/api/v1/invoices")
+            own_invoice = await client.get(
+                f"/api/v1/invoices/{owner.invoice_id}"
+            )
+            foreign_invoice = await client.get(
+                f"/api/v1/invoices/{other_owner.invoice_id}"
+            )
+            duplicate = await client.post(
+                "/api/v1/invoices",
+                json=valid_payload,
+            )
+            listing_after_conflict = await client.get("/api/v1/invoices")
+            same_landlord_wrong_unit = await client.post(
+                "/api/v1/invoices",
+                json=payload(alternate_unit_id, owner.tenant_id, f"{invoice_number}-B"),
+            )
+            foreign_tenant_own_unit = await client.post(
+                "/api/v1/invoices",
+                json=payload(owner.unit_id, other_owner.tenant_id, f"{invoice_number}-C"),
+            )
+            own_tenant_foreign_unit = await client.post(
+                "/api/v1/invoices",
+                json=payload(other_owner.unit_id, owner.tenant_id, f"{invoice_number}-D"),
+            )
+            foreign_tenant_foreign_unit = await client.post(
+                "/api/v1/invoices",
+                json=payload(other_owner.unit_id, other_owner.tenant_id, f"{invoice_number}-E"),
+            )
+            forged_scope = payload(owner.unit_id, owner.tenant_id, f"{invoice_number}-F")
+            forged_scope["landlord_id"] = str(other_owner.landlord_id)
+            client_scope = await client.post("/api/v1/invoices", json=forged_scope)
+            forged_total = payload(owner.unit_id, owner.tenant_id, f"{invoice_number}-G")
+            forged_total["total_amount"] = "0.00"
+            client_total = await client.post("/api/v1/invoices", json=forged_total)
+            forged_paid = payload(owner.unit_id, owner.tenant_id, f"{invoice_number}-H")
+            forged_paid["is_paid"] = True
+            client_paid = await client.post("/api/v1/invoices", json=forged_paid)
+            negative_amount = payload(owner.unit_id, owner.tenant_id, f"{invoice_number}-I")
+            negative_amount["rent_amount"] = "-0.01"
+            negative = await client.post("/api/v1/invoices", json=negative_amount)
+    finally:
+        if previous_db is None:
+            api_app.dependency_overrides.pop(get_db, None)
+        else:
+            api_app.dependency_overrides[get_db] = previous_db
+        if previous_principal is None:
+            api_app.dependency_overrides.pop(get_current_principal, None)
+        else:
+            api_app.dependency_overrides[get_current_principal] = previous_principal
+
+    assert created.status_code == 201
+    assert created.json()["total_amount"] == "12140.00"
+    assert created.json()["is_paid"] is False
+    assert "landlord_id" not in created.json()
+    assert "total_amount" not in valid_payload
+    assert listing.status_code == 200
+    listed_ids = {invoice["id"] for invoice in listing.json()}
+    assert str(owner.invoice_id) in listed_ids
+    assert str(other_owner.invoice_id) not in listed_ids
+    assert created.json()["id"] in listed_ids
+    assert {invoice["id"] for invoice in listing_after_conflict.json()} == listed_ids
+    assert own_invoice.status_code == 200
+    assert foreign_invoice.status_code == 404
+    assert duplicate.status_code == 409
+    assert same_landlord_wrong_unit.status_code == 404
+    assert foreign_tenant_own_unit.status_code == 404
+    assert own_tenant_foreign_unit.status_code == 404
+    assert foreign_tenant_foreign_unit.status_code == 404
+    assert client_scope.status_code == 422
+    assert client_total.status_code == 422
+    assert client_paid.status_code == 422
+    assert negative.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_payment_history_api_enforces_landlord_and_tenant_scope(rls_database):
+    owner = rls_database["a"]
+    other_owner = rls_database["b"]
+    active_principal = owner.principal
+
+    async def override_get_db():
+        async with rls_database["sessions"]() as session:
+            yield session
+
+    previous_db = api_app.dependency_overrides.get(get_db)
+    previous_principal = api_app.dependency_overrides.get(get_current_principal)
+    api_app.dependency_overrides[get_db] = override_get_db
+    api_app.dependency_overrides[get_current_principal] = lambda: active_principal
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=api_app),
+            base_url="http://test",
+        ) as client:
+            landlord_list = await client.get("/api/v1/payments")
+            landlord_own = await client.get(
+                f"/api/v1/payments/{owner.payment_id}"
+            )
+            landlord_foreign = await client.get(
+                f"/api/v1/payments/{other_owner.payment_id}"
+            )
+            active_principal = Principal(
+                user_id=str(uuid4()),
+                role=Role.TENANT,
+                landlord_id=str(owner.landlord_id),
+                tenant_id=str(owner.tenant_id),
+            )
+            tenant_list = await client.get("/api/v1/payments")
+            tenant_own = await client.get(
+                f"/api/v1/payments/{owner.payment_id}"
+            )
+            tenant_foreign = await client.get(
+                f"/api/v1/payments/{other_owner.payment_id}"
+            )
+    finally:
+        if previous_db is None:
+            api_app.dependency_overrides.pop(get_db, None)
+        else:
+            api_app.dependency_overrides[get_db] = previous_db
+        if previous_principal is None:
+            api_app.dependency_overrides.pop(get_current_principal, None)
+        else:
+            api_app.dependency_overrides[get_current_principal] = previous_principal
+
+    assert landlord_list.status_code == 200
+    assert [row["id"] for row in landlord_list.json()] == [str(owner.payment_id)]
+    assert landlord_own.status_code == 200
+    assert landlord_foreign.status_code == 404
+    assert tenant_list.status_code == 200
+    assert [row["id"] for row in tenant_list.json()] == [str(owner.payment_id)]
+    assert tenant_own.status_code == 200
+    assert tenant_foreign.status_code == 404
+    assert set(tenant_own.json()) == {
+        "id",
+        "tenant_id",
+        "mpesa_receipt_number",
+        "amount",
+        "payment_method",
+        "status",
+        "created_at",
+        "completed_at",
+    }
 
 
 @pytest.mark.asyncio
@@ -339,3 +895,427 @@ async def test_system_session_remains_separate_and_bypasses_rls(rls_database):
         assert row[2] == 2
     finally:
         await engine.dispose()
+
+
+async def _insert_unassigned_payment(rls_database, owner: Owner, amount: int = 15000):
+    raw_webhook_id = uuid4()
+    payment_id = uuid4()
+    processing_id = uuid4()
+    unassigned_id = uuid4()
+    receipt = f"RLS-UNASSIGNED-{uuid4().hex}"
+    async with rls_database["admin_engine"].begin() as connection:
+        await connection.execute(text("""
+            INSERT INTO raw_payment_webhooks (
+                id, merchant_request_id, checkout_request_id,
+                mpesa_receipt_number, raw_payload
+            ) VALUES (
+                :id, :merchant_request_id, :checkout_request_id,
+                :receipt, '{}'::jsonb
+            )
+        """), {
+            "id": raw_webhook_id,
+            "merchant_request_id": f"MERCHANT-{raw_webhook_id}",
+            "checkout_request_id": f"CHECKOUT-{raw_webhook_id}",
+            "receipt": receipt,
+        })
+        await connection.execute(text("""
+            INSERT INTO payment_transactions (
+                id, landlord_id, tenant_id, raw_webhook_id,
+                merchant_request_id, checkout_request_id,
+                mpesa_receipt_number, payer_phone, payer_name, amount,
+                payment_method, status, completed_at
+            ) VALUES (
+                :id, :landlord_id, NULL, :raw_webhook_id,
+                :merchant_request_id, :checkout_request_id,
+                :receipt, '254711000001', 'Unmatched Payer', :amount,
+                'MPESA_STK_PUSH', 'COMPLETED', CURRENT_TIMESTAMP
+            )
+        """), {
+            "id": payment_id,
+            "landlord_id": owner.landlord_id,
+            "raw_webhook_id": raw_webhook_id,
+            "merchant_request_id": f"MERCHANT-{raw_webhook_id}",
+            "checkout_request_id": f"CHECKOUT-{raw_webhook_id}",
+            "receipt": receipt,
+            "amount": amount,
+        })
+        await connection.execute(text("""
+            INSERT INTO payment_processing (
+                id, mpesa_receipt_number, raw_webhook_id, landlord_id, status
+            ) VALUES (:id, :receipt, :raw_webhook_id, :landlord_id, 'UNASSIGNED')
+        """), {
+            "id": processing_id,
+            "receipt": receipt,
+            "raw_webhook_id": raw_webhook_id,
+            "landlord_id": owner.landlord_id,
+        })
+        await connection.execute(text("""
+            INSERT INTO unassigned_payments (
+                id, landlord_id, raw_webhook_id, mpesa_receipt_number,
+                amount, payer_phone, payer_name, invalid_account_reference
+            ) VALUES (
+                :id, :landlord_id, :raw_webhook_id, :receipt,
+                :amount, '254711000001', 'Unmatched Payer', 'INVALID-ACCOUNT'
+            )
+        """), {
+            "id": unassigned_id,
+            "landlord_id": owner.landlord_id,
+            "raw_webhook_id": raw_webhook_id,
+            "receipt": receipt,
+            "amount": amount,
+        })
+    return {
+        "id": unassigned_id,
+        "payment_id": payment_id,
+        "processing_id": processing_id,
+        "raw_webhook_id": raw_webhook_id,
+        "receipt": receipt,
+    }
+
+
+async def _delete_unassigned_fixture(rls_database, fixture: dict[str, object]) -> None:
+    async with rls_database["admin_engine"].begin() as connection:
+        await connection.execute(
+            text("DELETE FROM outbox_events WHERE aggregate_id = :payment_id"),
+            {"payment_id": fixture["payment_id"]},
+        )
+        await connection.execute(
+            text("DELETE FROM ledger_entries WHERE payment_transaction_id = :payment_id"),
+            {"payment_id": fixture["payment_id"]},
+        )
+        await connection.execute(
+            text("DELETE FROM payment_allocations WHERE payment_transaction_id = :payment_id"),
+            {"payment_id": fixture["payment_id"]},
+        )
+        await connection.execute(
+            text("DELETE FROM payment_credits WHERE payment_transaction_id = :payment_id"),
+            {"payment_id": fixture["payment_id"]},
+        )
+        await connection.execute(
+            text("DELETE FROM unassigned_payments WHERE id = :id"),
+            {"id": fixture["id"]},
+        )
+        await connection.execute(
+            text("DELETE FROM payment_processing WHERE id = :id"),
+            {"id": fixture["processing_id"]},
+        )
+        await connection.execute(
+            text("DELETE FROM payment_transactions WHERE id = :id"),
+            {"id": fixture["payment_id"]},
+        )
+        await connection.execute(
+            text("DELETE FROM raw_payment_webhooks WHERE id = :id"),
+            {"id": fixture["raw_webhook_id"]},
+        )
+
+
+async def _resolution_client(rls_database, principal: Principal):
+    async def override_get_db():
+        async with rls_database["sessions"]() as session:
+            yield session
+
+    previous_db = api_app.dependency_overrides.get(get_db)
+    previous_principal = api_app.dependency_overrides.get(get_current_principal)
+    api_app.dependency_overrides[get_db] = override_get_db
+    api_app.dependency_overrides[get_current_principal] = lambda: principal
+    return previous_db, previous_principal
+
+
+def _restore_resolution_client(previous_db, previous_principal) -> None:
+    if previous_db is None:
+        api_app.dependency_overrides.pop(get_db, None)
+    else:
+        api_app.dependency_overrides[get_db] = previous_db
+    if previous_principal is None:
+        api_app.dependency_overrides.pop(get_current_principal, None)
+    else:
+        api_app.dependency_overrides[get_current_principal] = previous_principal
+
+
+@pytest.mark.asyncio
+async def test_unassigned_payment_resolution_records_all_financial_effects_and_is_idempotent(rls_database):
+    owner = rls_database["a"]
+    fixture = await _insert_unassigned_payment(rls_database, owner)
+    previous = await _resolution_client(rls_database, owner.principal)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=api_app),
+            base_url="http://test",
+        ) as client:
+            listing = await client.get("/api/v1/unassigned-payments")
+            response = await client.post(
+                f"/api/v1/unassigned-payments/{fixture['id']}/resolve",
+                json={"tenant_id": str(owner.tenant_id)},
+            )
+            repeated = await client.post(
+                f"/api/v1/unassigned-payments/{fixture['id']}/resolve",
+                json={"tenant_id": str(owner.tenant_id)},
+            )
+            concurrent = await asyncio.gather(*(
+                client.post(
+                    f"/api/v1/unassigned-payments/{fixture['id']}/resolve",
+                    json={"tenant_id": str(owner.tenant_id)},
+                )
+                for _ in range(2)
+            ))
+    finally:
+        _restore_resolution_client(*previous)
+
+    assert listing.status_code == 200
+    assert any(row["id"] == str(fixture["id"]) for row in listing.json())
+    assert response.status_code == 200
+    body = response.json()
+    assert body["payment_transaction_id"] == str(fixture["payment_id"])
+    assert body["tenant_id"] == str(owner.tenant_id)
+    assert body["unit_id"] == str(owner.unit_id)
+    assert body["allocation"]["status"] == "OVERPAYMENT_CREDITED"
+    assert body["allocation"]["allocated_amount"] == "12000.00"
+    assert body["allocation"]["excess_amount"] == "3000.00"
+    assert repeated.status_code == 409
+    assert [item.status_code for item in concurrent] == [409, 409]
+
+    async with rls_database["admin_engine"].connect() as connection:
+        assert await connection.scalar(text(
+            "SELECT tenant_id FROM payment_transactions WHERE id = :id"
+        ), {"id": fixture["payment_id"]}) == owner.tenant_id
+        assert await connection.scalar(text(
+            "SELECT status FROM payment_processing WHERE id = :id"
+        ), {"id": fixture["processing_id"]}) == "COMPLETED"
+        resolved = (await connection.execute(text("""
+            SELECT is_resolved, resolved_unit_id, resolved_by_user_id, resolved_at
+            FROM unassigned_payments WHERE id = :id
+        """), {"id": fixture["id"]})).one()
+        assert resolved[0] is True
+        assert resolved[1] == owner.unit_id
+        assert resolved[2] == UUID(owner.principal.user_id)
+        assert resolved[3] is not None
+        assert await connection.scalar(text(
+            "SELECT count(*) FROM payment_allocations WHERE payment_transaction_id = :id"
+        ), {"id": fixture["payment_id"]}) == 1
+        assert await connection.scalar(text(
+            "SELECT amount FROM payment_credits WHERE payment_transaction_id = :id"
+        ), {"id": fixture["payment_id"]}) == 3000
+        assert await connection.scalar(text(
+            "SELECT count(*) FROM ledger_entries WHERE payment_transaction_id = :id"
+        ), {"id": fixture["payment_id"]}) == 1
+        assert await connection.scalar(text(
+            "SELECT count(*) FROM outbox_events WHERE aggregate_id = :id"
+        ), {"id": fixture["payment_id"]}) == 1
+
+    await _delete_unassigned_fixture(rls_database, fixture)
+
+
+@pytest.mark.asyncio
+async def test_unassigned_resolution_rejects_foreign_and_inactive_tenants(rls_database):
+    owner, other = rls_database["a"], rls_database["b"]
+    fixture = await _insert_unassigned_payment(rls_database, owner)
+    inactive_tenant_id = uuid4()
+    async with rls_database["admin_engine"].begin() as connection:
+        await connection.execute(text("""
+            INSERT INTO tenants (
+                id, landlord_id, unit_id, full_name, primary_phone,
+                lease_start_date, is_active
+            ) VALUES (
+                :id, :landlord_id, :unit_id, 'Inactive Tenant',
+                :phone, DATE '2026-01-01', FALSE
+            )
+        """), {
+            "id": inactive_tenant_id,
+            "landlord_id": owner.landlord_id,
+            "unit_id": owner.unit_id,
+            "phone": f"254722{inactive_tenant_id.int % 1000000:06d}",
+        })
+
+    previous = await _resolution_client(rls_database, owner.principal)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=api_app),
+            base_url="http://test",
+        ) as client:
+            foreign = await client.post(
+                f"/api/v1/unassigned-payments/{fixture['id']}/resolve",
+                json={"tenant_id": str(other.tenant_id)},
+            )
+            inactive = await client.post(
+                f"/api/v1/unassigned-payments/{fixture['id']}/resolve",
+                json={"tenant_id": str(inactive_tenant_id)},
+            )
+    finally:
+        _restore_resolution_client(*previous)
+        async with rls_database["admin_engine"].begin() as connection:
+            await connection.execute(
+                text("DELETE FROM tenants WHERE id = :id"),
+                {"id": inactive_tenant_id},
+            )
+        await _delete_unassigned_fixture(rls_database, fixture)
+
+    assert foreign.status_code == 404
+    assert inactive.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_outbox_app_access_is_limited_to_current_landlord_payment_events(rls_database):
+    owner, other = rls_database["a"], rls_database["b"]
+    event_id = uuid4()
+    idempotency_key = f"RLS-OUTBOX-{uuid4()}"
+    async with rls_database["sessions"]() as session, session.begin():
+        await set_rls_context(session, owner.principal)
+        await session.execute(text("""
+            INSERT INTO outbox_events (
+                id, event_type, aggregate_type, aggregate_id,
+                idempotency_key, payload
+            ) VALUES (
+                :id, 'PAYMENT_PROCESSED', 'PAYMENT_TRANSACTION',
+                :aggregate_id, :idempotency_key, '{}'::jsonb
+            )
+        """), {
+            "id": event_id,
+            "aggregate_id": owner.payment_id,
+            "idempotency_key": idempotency_key,
+        })
+        assert await session.scalar(text(
+            "SELECT count(*) FROM outbox_events WHERE id = :id"
+        ), {"id": event_id}) == 1
+
+    async with rls_database["sessions"]() as session, session.begin():
+        await set_rls_context(session, other.principal)
+        assert await session.scalar(text(
+            "SELECT count(*) FROM outbox_events WHERE id = :id"
+        ), {"id": event_id}) == 0
+
+    with pytest.raises(DBAPIError):
+        async with rls_database["sessions"]() as session, session.begin():
+            await set_rls_context(session, owner.principal)
+            await session.execute(text("""
+                INSERT INTO outbox_events (
+                    event_type, aggregate_type, aggregate_id,
+                    idempotency_key, payload
+                ) VALUES (
+                    'PAYMENT_PROCESSED', 'PAYMENT_TRANSACTION',
+                    :aggregate_id, :idempotency_key, '{}'::jsonb
+                )
+            """), {
+                "aggregate_id": other.payment_id,
+                "idempotency_key": f"{idempotency_key}-foreign",
+            })
+
+    async with rls_database["admin_engine"].begin() as connection:
+        await connection.execute(
+            text("DELETE FROM outbox_events WHERE id = :id"),
+            {"id": event_id},
+        )
+
+
+@pytest.mark.asyncio
+async def test_payment_allocation_and_credit_reads_enforce_payment_scope(rls_database):
+    owner, other = rls_database["a"], rls_database["b"]
+    allocation_id = uuid4()
+    credit_id = uuid4()
+    async with rls_database["admin_engine"].begin() as connection:
+        await connection.execute(text("""
+            INSERT INTO payment_allocations (
+                id, payment_transaction_id, invoice_id, amount, status
+            ) VALUES (
+                :id, :payment_id, :invoice_id, 4500, 'ALLOCATED'
+            )
+        """), {
+            "id": allocation_id,
+            "payment_id": owner.payment_id,
+            "invoice_id": owner.invoice_id,
+        })
+        await connection.execute(text("""
+            INSERT INTO payment_credits (
+                id, payment_transaction_id, tenant_id, amount, status
+            ) VALUES (
+                :id, :payment_id, :tenant_id, 750, 'AVAILABLE'
+            )
+        """), {
+            "id": credit_id,
+            "payment_id": owner.payment_id,
+            "tenant_id": owner.tenant_id,
+        })
+
+    previous = await _resolution_client(rls_database, owner.principal)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=api_app),
+            base_url="http://test",
+        ) as client:
+            landlord_allocations = await client.get(
+                f"/api/v1/payments/{owner.payment_id}/allocations"
+            )
+            landlord_credits = await client.get(
+                f"/api/v1/payments/{owner.payment_id}/credits"
+            )
+            foreign_allocations = await client.get(
+                f"/api/v1/payments/{other.payment_id}/allocations"
+            )
+            foreign_credits = await client.get(
+                f"/api/v1/payments/{other.payment_id}/credits"
+            )
+
+            tenant_principal = Principal(
+                user_id=str(uuid4()),
+                role=Role.TENANT,
+                landlord_id=str(owner.landlord_id),
+                tenant_id=str(owner.tenant_id),
+            )
+            await _resolution_client(rls_database, tenant_principal)
+            tenant_allocations = await client.get(
+                f"/api/v1/payments/{owner.payment_id}/allocations"
+            )
+            tenant_credits = await client.get(
+                f"/api/v1/payments/{owner.payment_id}/credits"
+            )
+            tenant_foreign = await client.get(
+                f"/api/v1/payments/{other.payment_id}/allocations"
+            )
+    finally:
+        _restore_resolution_client(*previous)
+        async with rls_database["admin_engine"].begin() as connection:
+            await connection.execute(
+                text("DELETE FROM payment_allocations WHERE id = :id"),
+                {"id": allocation_id},
+            )
+            await connection.execute(
+                text("DELETE FROM payment_credits WHERE id = :id"),
+                {"id": credit_id},
+            )
+
+    assert landlord_allocations.status_code == 200
+    assert landlord_allocations.json()[0]["id"] == str(allocation_id)
+    assert landlord_allocations.json()[0]["invoice_id"] == str(owner.invoice_id)
+    assert landlord_allocations.json()[0]["amount"] == "4500.00"
+    assert landlord_credits.status_code == 200
+    assert landlord_credits.json()[0]["id"] == str(credit_id)
+    assert landlord_credits.json()[0]["tenant_id"] == str(owner.tenant_id)
+    assert landlord_credits.json()[0]["amount"] == "750.00"
+    assert foreign_allocations.status_code == 404
+    assert foreign_credits.status_code == 404
+    assert tenant_allocations.status_code == 200
+    assert tenant_credits.status_code == 200
+    assert tenant_foreign.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_ledger_read_api_lists_and_reads_only_authenticated_landlord_rows(rls_database):
+    owner, other = rls_database["a"], rls_database["b"]
+    previous = await _resolution_client(rls_database, owner.principal)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=api_app),
+            base_url="http://test",
+        ) as client:
+            listing = await client.get("/api/v1/ledger")
+            own_entry = await client.get(f"/api/v1/ledger/{owner.ledger_id}")
+            foreign_entry = await client.get(f"/api/v1/ledger/{other.ledger_id}")
+    finally:
+        _restore_resolution_client(*previous)
+
+    assert listing.status_code == 200
+    assert [row["id"] for row in listing.json()] == [str(owner.ledger_id)]
+    assert own_entry.status_code == 200
+    assert own_entry.json()["payment_transaction_id"] == str(owner.payment_id)
+    assert own_entry.json()["amount"] == "12000.00"
+    assert "payer_phone" not in own_entry.json()
+    assert foreign_entry.status_code == 404

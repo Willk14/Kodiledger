@@ -3,13 +3,12 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from app.core.config import settings
 from app.core.database import SystemSessionLocal
 from app.integrations.events.kafka_publisher import KafkaEventPublisher
 from app.services.outbox_worker import OutboxWorker
 
 
-POLL_INTERVAL_SECONDS = 5
-BATCH_SIZE = 100
 MAX_ATTEMPTS = 5
 
 
@@ -24,14 +23,18 @@ async def run_forever() -> None:
     worker = OutboxWorker(
         SystemSessionLocal,
         publisher,
-        batch_size=BATCH_SIZE,
+        batch_size=settings.OUTBOX_BATCH_SIZE,
         max_attempts=MAX_ATTEMPTS,
+        lock_timeout_seconds=settings.OUTBOX_LOCK_TIMEOUT_SECONDS,
     )
 
     logger.info(
-        "Outbox worker started: poll_interval=%ss batch_size=%s max_attempts=%s",
-        POLL_INTERVAL_SECONDS,
-        BATCH_SIZE,
+        "Outbox worker started poll_interval_ms=%d batch_size=%d "
+        "max_batch_wait_ms=%d lock_timeout_seconds=%d max_attempts=%d",
+        settings.OUTBOX_POLL_INTERVAL_MS,
+        settings.OUTBOX_BATCH_SIZE,
+        settings.OUTBOX_MAX_BATCH_WAIT_MS,
+        settings.OUTBOX_LOCK_TIMEOUT_SECONDS,
         MAX_ATTEMPTS,
     )
 
@@ -52,7 +55,7 @@ async def run_forever() -> None:
             except Exception:
                 logger.exception("Outbox worker iteration failed")
 
-            await asyncio.sleep(POLL_INTERVAL_SECONDS)
+            await asyncio.sleep(settings.OUTBOX_POLL_INTERVAL_MS / 1000)
 
     finally:
         await publisher.stop()

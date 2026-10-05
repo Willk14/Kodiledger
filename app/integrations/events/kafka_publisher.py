@@ -23,6 +23,7 @@ class KafkaEventPublisher(EventPublisher):
         self._producer = AIOKafkaProducer(
             bootstrap_servers=self.bootstrap_servers,
             enable_idempotence=True,
+            linger_ms=settings.OUTBOX_MAX_BATCH_WAIT_MS,
         )
 
     async def start(self) -> None:

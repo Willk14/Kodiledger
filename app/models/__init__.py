@@ -11,6 +11,7 @@ from app.models.ledger_entry import LedgerEntry
 from app.models.outbox_event import OutboxEvent
 from app.models.payment_allocation import PaymentAllocation
 from app.models.payment_credit import PaymentCredit
+from app.models.payment_credit_application import PaymentCreditApplication
 from app.models.payment_processing import PaymentProcessing
 from app.models.payment_transaction import PaymentTransaction
 from app.models.property import Property
@@ -30,6 +31,7 @@ __all__ = [
     "OutboxEvent",
     "PaymentAllocation",
     "PaymentCredit",
+    "PaymentCreditApplication",
     "PaymentProcessing",
     "PaymentTransaction",
     "Property",

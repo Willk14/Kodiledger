@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 
 from uuid import uuid4
@@ -12,6 +13,11 @@ import pytest_asyncio
 from dotenv import dotenv_values
 from sqlalchemy import text
 from app.repositories.outbox_event_repository import OutboxEventRepository
+from app.repositories.invoice_repository import InvoiceRepository
+from app.repositories.payment_allocation_repository import PaymentAllocationRepository
+from app.repositories.payment_credit_repository import PaymentCreditRepository
+from app.repositories.payment_transaction_repository import PaymentTransactionRepository
+from app.services.invoice_allocation_service import InvoiceAllocationService
 from app.services.outbox_worker import OutboxWorker
 from app.services.test_event_publisher import TestEventPublisher
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -74,6 +80,12 @@ async def _test_system_db():
 async def _clean_webhook_test_data(db: AsyncSession) -> None:
     transaction_ids = "SELECT id FROM payment_transactions WHERE mpesa_receipt_number LIKE 'IT-%'"
     await db.execute(text(f"DELETE FROM outbox_events WHERE idempotency_key LIKE 'IT-%' OR aggregate_id IN ({transaction_ids})"))
+    await db.execute(text(f"""
+        DELETE FROM payment_credit_applications
+        WHERE payment_credit_id IN (
+            SELECT id FROM payment_credits WHERE payment_transaction_id IN ({transaction_ids})
+        ) OR invoice_id IN (SELECT id FROM invoices WHERE invoice_number LIKE 'IT-%')
+    """))
     await db.execute(text(f"DELETE FROM payment_credits WHERE payment_transaction_id IN ({transaction_ids})"))
     await db.execute(text(f"DELETE FROM payment_allocations WHERE payment_transaction_id IN ({transaction_ids})"))
     await db.execute(text(f"DELETE FROM ledger_entries WHERE payment_transaction_id IN ({transaction_ids}) OR invoice_id IN (SELECT id FROM invoices WHERE invoice_number LIKE 'IT-%')"))
@@ -146,7 +158,13 @@ async def webhook_api_test_database():
             app.dependency_overrides[get_system_db] = previous
 
 
-def callback_payload(receipt: str, merchant: str, checkout: str, amount: int):
+def callback_payload(
+    receipt: str,
+    merchant: str,
+    checkout: str,
+    amount: int,
+    payer_phone: str = TENANT_PHONE,
+):
     return {
         "Body": {
             "stkCallback": {
@@ -163,7 +181,7 @@ def callback_payload(receipt: str, merchant: str, checkout: str, amount: int):
                         },
                         {
                             "Name": "PhoneNumber",
-                            "Value": TENANT_PHONE,
+                            "Value": payer_phone,
                         },
                     ]
                 },
@@ -3773,3 +3791,588 @@ async def test_outbox_worker_recovers_crash_after_publish_before_state_update():
                     {"event_id": event_id},
                 )
                 await db.commit()
+
+
+def _direct_allocation_service(db: AsyncSession) -> InvoiceAllocationService:
+    return InvoiceAllocationService(
+        invoice_repository=InvoiceRepository(db),
+        payment_allocation_repository=PaymentAllocationRepository(db),
+        payment_credit_repository=PaymentCreditRepository(db),
+        payment_transaction_repository=PaymentTransactionRepository(db),
+    )
+
+
+async def _create_direct_allocation_fixture(
+    *,
+    suffix: str,
+    payment_amount: Decimal,
+    invoice_amounts: list[Decimal],
+) -> tuple[str, list[str]]:
+    async with TestSystemSessionLocal() as db:
+        transaction_result = await db.execute(
+            text(
+                """
+                INSERT INTO payment_transactions (
+                    landlord_id, tenant_id, mpesa_receipt_number,
+                    amount, payment_method, status, completed_at
+                )
+                VALUES (
+                    :landlord_id, :tenant_id, :receipt,
+                    :amount, 'MPESA_STK_PUSH', 'COMPLETED', CURRENT_TIMESTAMP
+                )
+                RETURNING id
+                """
+            ),
+            {
+                "landlord_id": LANDLORD_ID,
+                "tenant_id": TENANT_ID,
+                "receipt": f"IT-ALLOC-DIRECT-{suffix}",
+                "amount": payment_amount,
+            },
+        )
+        payment_transaction_id = str(transaction_result.scalar_one())
+
+        invoice_ids: list[str] = []
+        for index, invoice_amount in enumerate(invoice_amounts):
+            invoice_result = await db.execute(
+                text(
+                    """
+                    INSERT INTO invoices (
+                        landlord_id, unit_id, tenant_id, invoice_number,
+                        billing_month, rent_amount, water_amount,
+                        garbage_amount, security_amount, due_date, is_paid
+                    )
+                    VALUES (
+                        :landlord_id, :unit_id, :tenant_id, :invoice_number,
+                        :billing_month, :rent_amount, 0, 0, 0, :due_date, FALSE
+                    )
+                    RETURNING id
+                    """
+                ),
+                {
+                    "landlord_id": LANDLORD_ID,
+                    "unit_id": UNIT_ID,
+                    "tenant_id": TENANT_ID,
+                    "invoice_number": f"IT-ALLOC-DIRECT-{suffix}-{index}",
+                    "billing_month": date(2026, index + 1, 1),
+                    "rent_amount": invoice_amount,
+                    "due_date": date(2026, index + 1, 15),
+                },
+            )
+            invoice_ids.append(str(invoice_result.scalar_one()))
+
+        await db.commit()
+        return payment_transaction_id, invoice_ids
+
+
+async def _delete_direct_allocation_fixture(
+    *,
+    payment_transaction_id: str,
+    invoice_ids: list[str],
+) -> None:
+    async with TestSystemSessionLocal() as db:
+        await db.execute(
+            text("""
+                DELETE FROM payment_credit_applications
+                WHERE payment_credit_id IN (
+                    SELECT id FROM payment_credits WHERE payment_transaction_id = :id
+                ) OR invoice_id = ANY(CAST(:invoice_ids AS uuid[]))
+            """),
+            {"id": payment_transaction_id, "invoice_ids": invoice_ids},
+        )
+        await db.execute(
+            text("DELETE FROM payment_credits WHERE payment_transaction_id = :id"),
+            {"id": payment_transaction_id},
+        )
+        await db.execute(
+            text("DELETE FROM payment_allocations WHERE payment_transaction_id = :id"),
+            {"id": payment_transaction_id},
+        )
+        await db.execute(
+            text("DELETE FROM payment_transactions WHERE id = :id"),
+            {"id": payment_transaction_id},
+        )
+        for invoice_id in invoice_ids:
+            await db.execute(
+                text("DELETE FROM invoices WHERE id = :id"),
+                {"id": invoice_id},
+            )
+        await db.commit()
+
+
+async def _wait_for_postgres_blocker(
+    *,
+    waiting_pid: int,
+    blocker_pid: int,
+) -> None:
+    async with TestSystemSessionLocal() as monitor:
+        for _ in range(1000):
+            blocking_pids = await monitor.scalar(
+                text(
+                    """
+                    SELECT pg_blocking_pids(:waiting_pid)
+                    """
+                ),
+                {"waiting_pid": waiting_pid},
+            )
+            if blocker_pid in blocking_pids:
+                return
+            await asyncio.sleep(0.01)
+    raise AssertionError(
+        "Second allocator transaction was not blocked by the first payment-row lock."
+    )
+
+
+async def _run_same_payment_concurrently(
+    *,
+    payment_transaction_id: str,
+    requested_amount: Decimal,
+) -> tuple[dict, dict]:
+    first_has_allocated = asyncio.Event()
+    second_has_backend_pid = asyncio.Event()
+    allow_first_to_commit = asyncio.Event()
+    backend_pids: dict[str, int] = {}
+
+    async def first_request() -> dict:
+        async with TestSystemSessionLocal() as db:
+            async with db.begin():
+                backend_pids["first"] = await db.scalar(
+                    text("SELECT pg_backend_pid()")
+                )
+                # Hold the persisted payment row while the first allocation is
+                # written so the second independent connection must wait.
+                await db.execute(
+                    text(
+                        "SELECT id FROM payment_transactions "
+                        "WHERE id = :id FOR UPDATE"
+                    ),
+                    {"id": payment_transaction_id},
+                )
+                result = await _direct_allocation_service(db).allocate_payment(
+                    payment_transaction_id=payment_transaction_id,
+                    tenant_id=TENANT_ID,
+                    payment_amount=requested_amount,
+                )
+                first_has_allocated.set()
+                await allow_first_to_commit.wait()
+                return result
+
+    async def second_request() -> dict:
+        async with TestSystemSessionLocal() as db:
+            async with db.begin():
+                backend_pids["second"] = await db.scalar(
+                    text("SELECT pg_backend_pid()")
+                )
+                second_has_backend_pid.set()
+                return await _direct_allocation_service(db).allocate_payment(
+                    payment_transaction_id=payment_transaction_id,
+                    tenant_id=TENANT_ID,
+                    payment_amount=requested_amount,
+                )
+
+    first_task = asyncio.create_task(first_request())
+    second_task = None
+    try:
+        await asyncio.wait_for(first_has_allocated.wait(), timeout=10)
+        second_task = asyncio.create_task(second_request())
+        await asyncio.wait_for(second_has_backend_pid.wait(), timeout=10)
+        await asyncio.wait_for(
+            _wait_for_postgres_blocker(
+                waiting_pid=backend_pids["second"],
+                blocker_pid=backend_pids["first"],
+            ),
+            timeout=15,
+        )
+        allow_first_to_commit.set()
+        return await asyncio.gather(first_task, second_task)
+    finally:
+        allow_first_to_commit.set()
+        pending = [task for task in (first_task, second_task) if task is not None]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_same_payment_concurrent_allocations_conserve_payment_across_invoices():
+    suffix = uuid4().hex
+    payment_transaction_id, invoice_ids = await _create_direct_allocation_fixture(
+        suffix=suffix,
+        payment_amount=Decimal("1000"),
+        invoice_amounts=[Decimal("700"), Decimal("700")],
+    )
+    try:
+        first, second = await _run_same_payment_concurrently(
+            payment_transaction_id=payment_transaction_id,
+            requested_amount=Decimal("700"),
+        )
+        assert {first["status"], second["status"]} == {
+            "ALLOCATED",
+            "PARTIALLY_ALLOCATED",
+        }
+
+        async with TestSystemSessionLocal() as db:
+            totals = (
+                await db.execute(
+                    text(
+                        """
+                        SELECT
+                            COALESCE(SUM(pa.amount), 0) AS allocated,
+                            COALESCE((
+                                SELECT SUM(pc.amount)
+                                FROM payment_credits pc
+                                WHERE pc.payment_transaction_id = :payment_id
+                            ), 0) AS credited
+                        FROM payment_allocations pa
+                        WHERE pa.payment_transaction_id = :payment_id
+                          AND pa.status = 'ALLOCATED'
+                        """
+                    ),
+                    {"payment_id": payment_transaction_id},
+                )
+            ).mappings().one()
+            assert totals["allocated"] == Decimal("1000")
+            assert totals["credited"] == Decimal("0")
+            assert totals["allocated"] + totals["credited"] <= Decimal("1000")
+
+            invoice_states = [
+                await db.scalar(
+                    text("SELECT is_paid FROM invoices WHERE id = :id"),
+                    {"id": invoice_id},
+                )
+                for invoice_id in invoice_ids
+            ]
+            assert sorted(invoice_states) == [False, True]
+    finally:
+        await _delete_direct_allocation_fixture(
+            payment_transaction_id=payment_transaction_id,
+            invoice_ids=invoice_ids,
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_same_payment_same_invoice_concurrent_duplicate_is_idempotent():
+    suffix = uuid4().hex
+    payment_transaction_id, invoice_ids = await _create_direct_allocation_fixture(
+        suffix=suffix,
+        payment_amount=Decimal("1000"),
+        invoice_amounts=[Decimal("1000")],
+    )
+    try:
+        first, second = await _run_same_payment_concurrently(
+            payment_transaction_id=payment_transaction_id,
+            requested_amount=Decimal("700"),
+        )
+        assert first["status"] == "PARTIALLY_ALLOCATED"
+        assert second["status"] == "ALREADY_ALLOCATED"
+        assert second["reason"] == "PAYMENT_INVOICE_PAIR_EXISTS"
+        assert first["payment_allocation_id"] == second["payment_allocation_id"]
+
+        async with TestSystemSessionLocal() as db:
+            assert await db.scalar(
+                text(
+                    "SELECT COUNT(*) FROM payment_allocations "
+                    "WHERE payment_transaction_id = :id"
+                ),
+                {"id": payment_transaction_id},
+            ) == 1
+            assert await db.scalar(
+                text(
+                    "SELECT COALESCE(SUM(amount), 0) FROM payment_credits "
+                    "WHERE payment_transaction_id = :id"
+                ),
+                {"id": payment_transaction_id},
+            ) == Decimal("0")
+            assert await db.scalar(
+                text("SELECT is_paid FROM invoices WHERE id = :id"),
+                {"id": invoice_ids[0]},
+            ) is False
+    finally:
+        await _delete_direct_allocation_fixture(
+            payment_transaction_id=payment_transaction_id,
+            invoice_ids=invoice_ids,
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_sequential_allocations_and_credits_never_exceed_payment_amount():
+    suffix = uuid4().hex
+    payment_transaction_id, invoice_ids = await _create_direct_allocation_fixture(
+        suffix=suffix,
+        payment_amount=Decimal("1000"),
+        invoice_amounts=[Decimal("600"), Decimal("600")],
+    )
+    try:
+        async with TestSystemSessionLocal() as db:
+            async with db.begin():
+                first = await _direct_allocation_service(db).allocate_payment(
+                    payment_transaction_id=payment_transaction_id,
+                    tenant_id=TENANT_ID,
+                    payment_amount=Decimal("700"),
+                )
+        async with TestSystemSessionLocal() as db:
+            async with db.begin():
+                second = await _direct_allocation_service(db).allocate_payment(
+                    payment_transaction_id=payment_transaction_id,
+                    tenant_id=TENANT_ID,
+                    payment_amount=Decimal("700"),
+                )
+        async with TestSystemSessionLocal() as db:
+            async with db.begin():
+                third = await _direct_allocation_service(db).allocate_payment(
+                    payment_transaction_id=payment_transaction_id,
+                    tenant_id=TENANT_ID,
+                    payment_amount=Decimal("1000"),
+                )
+        assert first["status"] == "OVERPAYMENT_CREDITED"
+        assert second["status"] == "PARTIALLY_ALLOCATED"
+        assert third["reason"] == "PAYMENT_ALREADY_CONSUMED"
+
+        async with TestSystemSessionLocal() as db:
+            consumed = await db.scalar(
+                text(
+                    """
+                    SELECT
+                        COALESCE((SELECT SUM(amount) FROM payment_allocations
+                                  WHERE payment_transaction_id = :id
+                                    AND status = 'ALLOCATED'), 0)
+                        + COALESCE((SELECT SUM(amount) FROM payment_credits
+                                    WHERE payment_transaction_id = :id), 0)
+                    """
+                ),
+                {"id": payment_transaction_id},
+            )
+            assert consumed == Decimal("1000")
+    finally:
+        await _delete_direct_allocation_fixture(
+            payment_transaction_id=payment_transaction_id,
+            invoice_ids=invoice_ids,
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_downstream_failure_rolls_back_allocation_credit_and_invoice_state():
+    suffix = uuid4().hex
+    payment_transaction_id, invoice_ids = await _create_direct_allocation_fixture(
+        suffix=suffix,
+        payment_amount=Decimal("1000"),
+        invoice_amounts=[Decimal("700")],
+    )
+    try:
+        with pytest.raises(RuntimeError, match="simulated downstream failure"):
+            async with TestSystemSessionLocal() as db:
+                async with db.begin():
+                    result = await _direct_allocation_service(db).allocate_payment(
+                        payment_transaction_id=payment_transaction_id,
+                        tenant_id=TENANT_ID,
+                        payment_amount=Decimal("1000"),
+                    )
+                    assert result["status"] == "OVERPAYMENT_CREDITED"
+                    raise RuntimeError("simulated downstream failure")
+
+        async with TestSystemSessionLocal() as db:
+            assert await db.scalar(
+                text("SELECT COUNT(*) FROM payment_allocations WHERE payment_transaction_id = :id"),
+                {"id": payment_transaction_id},
+            ) == 0
+            assert await db.scalar(
+                text("SELECT COUNT(*) FROM payment_credits WHERE payment_transaction_id = :id"),
+                {"id": payment_transaction_id},
+            ) == 0
+            assert await db.scalar(
+                text("SELECT is_paid FROM invoices WHERE id = :id"),
+                {"id": invoice_ids[0]},
+            ) is False
+    finally:
+        await _delete_direct_allocation_fixture(
+            payment_transaction_id=payment_transaction_id,
+            invoice_ids=invoice_ids,
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_payment_without_unpaid_invoice_becomes_tenant_credit_atomically():
+    suffix = uuid4().hex[:12]
+    receipt = f"IT-NO-INVOICE-{suffix}"
+    merchant = f"IT-NO-INVOICE-MERCHANT-{suffix}"
+    checkout = f"IT-NO-INVOICE-CHECKOUT-{suffix}"
+    tenant_id, unit_id = uuid4(), uuid4()
+    payer_phone = f"254{uuid4().int % 1_000_000_000:09d}"
+    payment_amount = Decimal("275.00")
+
+    async with TestSystemSessionLocal() as db:
+        await db.execute(text("""
+            INSERT INTO units (
+                id, property_id, landlord_id, unit_number, base_rent
+            ) VALUES (
+                :unit_id, '22222222-2222-2222-2222-222222222222',
+                :landlord_id, :unit_number, 100
+            )
+        """), {
+            "unit_id": unit_id,
+            "landlord_id": LANDLORD_ID,
+            "unit_number": f"NI-{suffix}",
+        })
+        await db.execute(text("""
+            INSERT INTO tenants (
+                id, landlord_id, unit_id, full_name, primary_phone,
+                lease_start_date
+            ) VALUES (
+                :tenant_id, :landlord_id, :unit_id, 'No Invoice Tenant',
+                :phone, CURRENT_DATE
+            )
+        """), {
+            "tenant_id": tenant_id,
+            "landlord_id": LANDLORD_ID,
+            "unit_id": unit_id,
+            "phone": payer_phone,
+        })
+        await db.commit()
+    await _record_stk_request(merchant, checkout)
+
+    try:
+        async with _webhook_client() as client:
+            response = await client.post(
+                WEBHOOK_URL,
+                json=callback_payload(
+                    receipt,
+                    merchant,
+                    checkout,
+                    int(payment_amount),
+                    payer_phone=payer_phone,
+                ),
+            )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["ResultCode"] == 0
+        assert body["reconciliation"]["status"] == "MATCHED"
+        allocation_result = body["reconciliation"]["allocation"]
+        assert allocation_result["status"] == "UNALLOCATED"
+        assert allocation_result["reason"] == "NO_UNPAID_INVOICE"
+        assert Decimal(str(allocation_result["credited_amount"])) == payment_amount
+
+        transaction_id = body["reconciliation"]["payment_transaction_id"]
+        async with TestSystemSessionLocal() as db:
+            payment = (await db.execute(text("""
+                SELECT amount, tenant_id FROM payment_transactions WHERE id = :id
+            """), {"id": transaction_id})).one()
+            credit = (await db.execute(text("""
+                SELECT amount, tenant_id, status FROM payment_credits
+                WHERE payment_transaction_id = :id
+            """), {"id": transaction_id})).one()
+            assert payment[0] == payment_amount
+            assert payment[1] == tenant_id
+            assert credit[0] == payment_amount
+            assert credit[1] == tenant_id
+            assert credit[2] == "AVAILABLE"
+            assert await db.scalar(text("""
+                SELECT count(*) FROM payment_allocations
+                WHERE payment_transaction_id = :id
+            """), {"id": transaction_id}) == 0
+            assert await db.scalar(text("""
+                SELECT count(*) FROM invoices WHERE tenant_id = :tenant_id
+            """), {"tenant_id": tenant_id}) == 0
+            assert await db.scalar(text("""
+                SELECT amount FROM ledger_entries WHERE payment_transaction_id = :id
+            """), {"id": transaction_id}) == payment_amount
+            assert await db.scalar(text("""
+                SELECT count(*) FROM outbox_events WHERE aggregate_id = :id
+            """), {"id": transaction_id}) == 1
+            consumed = await db.scalar(text("""
+                SELECT
+                    COALESCE((SELECT sum(amount) FROM payment_allocations
+                              WHERE payment_transaction_id = :id
+                                AND status = 'ALLOCATED'), 0)
+                    + COALESCE((SELECT sum(amount) FROM payment_credits
+                                WHERE payment_transaction_id = :id), 0)
+            """), {"id": transaction_id})
+            assert consumed == payment_amount
+    finally:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(text("""
+                DELETE FROM outbox_events
+                WHERE aggregate_id IN (
+                    SELECT id FROM payment_transactions WHERE mpesa_receipt_number = :receipt
+                )
+            """), {"receipt": receipt})
+            await db.execute(text("""
+                DELETE FROM ledger_entries
+                WHERE payment_transaction_id IN (
+                    SELECT id FROM payment_transactions WHERE mpesa_receipt_number = :receipt
+                )
+            """), {"receipt": receipt})
+            await db.execute(text("""
+                DELETE FROM payment_credits
+                WHERE payment_transaction_id IN (
+                    SELECT id FROM payment_transactions WHERE mpesa_receipt_number = :receipt
+                )
+            """), {"receipt": receipt})
+            await db.execute(text("""
+                DELETE FROM payment_allocations
+                WHERE payment_transaction_id IN (
+                    SELECT id FROM payment_transactions WHERE mpesa_receipt_number = :receipt
+                )
+            """), {"receipt": receipt})
+            await db.execute(text(
+                "DELETE FROM unassigned_payments WHERE mpesa_receipt_number = :receipt"
+            ), {"receipt": receipt})
+            await db.execute(text(
+                "DELETE FROM payment_transactions WHERE mpesa_receipt_number = :receipt"
+            ), {"receipt": receipt})
+            await db.execute(text(
+                "DELETE FROM payment_processing WHERE mpesa_receipt_number = :receipt"
+            ), {"receipt": receipt})
+            await db.execute(text("""
+                DELETE FROM raw_payment_webhooks
+                WHERE mpesa_receipt_number = :receipt OR merchant_request_id = :merchant
+            """), {"receipt": receipt, "merchant": merchant})
+            await db.execute(text(
+                "DELETE FROM stk_push_requests WHERE checkout_request_id = :checkout"
+            ), {"checkout": checkout})
+            await db.execute(text("DELETE FROM tenants WHERE id = :id"), {"id": tenant_id})
+            await db.execute(text("DELETE FROM units WHERE id = :id"), {"id": unit_id})
+            await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_concurrent_no_invoice_allocations_create_one_full_payment_credit():
+    payment_amount = Decimal("1000")
+    payment_transaction_id, invoice_ids = await _create_direct_allocation_fixture(
+        suffix=uuid4().hex,
+        payment_amount=payment_amount,
+        invoice_amounts=[],
+    )
+    try:
+        first, second = await _run_same_payment_concurrently(
+            payment_transaction_id=payment_transaction_id,
+            requested_amount=payment_amount,
+        )
+        assert first["status"] == "UNALLOCATED"
+        assert first["reason"] == "NO_UNPAID_INVOICE"
+        assert first["credited_amount"] == payment_amount
+        assert second["reason"] == "PAYMENT_ALREADY_CONSUMED"
+
+        async with TestSystemSessionLocal() as db:
+            assert await db.scalar(text("""
+                SELECT count(*) FROM payment_allocations
+                WHERE payment_transaction_id = :id
+            """), {"id": payment_transaction_id}) == 0
+            assert await db.scalar(text("""
+                SELECT count(*) FROM payment_credits
+                WHERE payment_transaction_id = :id
+            """), {"id": payment_transaction_id}) == 1
+            assert await db.scalar(text("""
+                SELECT amount FROM payment_credits
+                WHERE payment_transaction_id = :id
+            """), {"id": payment_transaction_id}) == payment_amount
+    finally:
+        await _delete_direct_allocation_fixture(
+            payment_transaction_id=payment_transaction_id,
+            invoice_ids=invoice_ids,
+        )

@@ -14,7 +14,7 @@ STK Push request
     -> asynchronous callback
     -> webhook audit record and receipt claim
     -> reconciliation and invoice allocation
-    -> payment credit when supported
+    -> payment credit for overpayment or no unpaid invoice
     -> ledger and transactional outbox
     -> Kafka publisher/worker
 ```
@@ -70,18 +70,18 @@ Pinned Python package versions are listed in [requirements.txt](requirements.txt
 | Status | Capabilities |
 | --- | --- |
 | Implemented | PostgreSQL schema and financial records; SQLAlchemy async sessions; M-Pesa OAuth token caching and STK Push initiation; callback ingestion and raw webhook persistence; Redis idempotency and rate limiting; PostgreSQL receipt claims; reconciliation, invoice allocation, payment credits, ledger writes, and transactional outbox; Kafka publisher/worker retry path; separate application and system database sessions. |
-| Foundation / partial | PostgreSQL RLS policies and transaction-local context helper exist. OIDC JWT verification resolves a provider issuer/subject to a local active account and membership. RBAC helpers and authenticated landlord/caretaker `/me` routes exist. The OIDC identity schema is migration 0013 and must be applied before that lookup works. |
-| In progress | Complete login and account provisioning lifecycle; broad business-route authentication, RBAC, and resource ownership enforcement; authenticated application-to-RLS context integration and PostgreSQL-backed cross-landlord isolation tests; callback sender authentication; sensitive error/log redaction. |
+| Foundation / partial | OIDC JWT verification resolves a provider issuer/subject to one active local account membership. RBAC protects selected landlord, caretaker, tenant, and admin routes; user-scoped business routes use transaction-local RLS context. The OIDC identity schema is migration 0013 and must be applied before lookup works. |
+| In progress | Complete login and account provisioning lifecycle; extend authenticated route coverage and resource ownership enforcement; validate deployed RLS role provisioning; callback sender authentication; sensitive error/log redaction. |
 | Planned / not in this repository | Next.js/React PWA, notification workflows, and broader operational/reporting API contracts described by the PRD. |
 
-RLS policies and the system database role are a database foundation; they do not prove end-to-end tenant isolation. Current RLS helper tests use mocks, and existing integration tests use the system connection. See [docs/SECURITY.md](docs/SECURITY.md) for the fuller status and gaps.
+RLS policies and the system database role are a database foundation; they do not prove end-to-end tenant isolation in every deployment. See [docs/auth.md](docs/auth.md) for the implemented route matrix and [docs/SECURITY.md](docs/SECURITY.md) for evidence and remaining gaps.
 
 ## 6. Financial Integrity Model
 
 - PostgreSQL is authoritative for persisted financial state; Redis is not.
 - Reconciliation and related payment records are written transactionally.
 - A repeated M-Pesa receipt must not create duplicate financial effects.
-- Invoice allocations and supported overpayment credits are persisted as separate records.
+- Invoice allocations and unapplied tenant credits are persisted as separate records.
 - The ledger provides durable financial history.
 - An outbox row is committed with the matched payment workflow so asynchronous publication can be retried after commit.
 
@@ -91,7 +91,7 @@ See [docs/SECURITY.md](docs/SECURITY.md) and [docs/DATABASE.md](docs/DATABASE.md
 
 Implemented controls include request-model validation, STK Push rate limiting, Redis idempotency backed by a PostgreSQL receipt claim, webhook audit persistence, callback shared-token and source-IP checks outside development/test, initiated-request ID correlation, transaction-local RLS settings in the RLS dependency, and separate application/system database sessions. OIDC verification checks the configured issuer, audience, expiry, and asymmetric signing key; role and domain scope are resolved from local membership data.
 
-Authentication is not applied across all business routes. The current bearer-protected routes are the landlord and caretaker context endpoints. The STK Push endpoint has no user authentication, and the webhook does not verify a Safaricom signature; it uses a shared URL token, IP filter, and initiated-request correlation. Application-to-RLS propagation and cross-landlord isolation are not proven end to end. Do not treat the repository as production-ready. See [docs/SECURITY.md](docs/SECURITY.md).
+Authentication is not applied across all business routes. Selected property, unit, tenant, invoice, payment, ledger, unassigned-payment, BFF, and admin operator routes are bearer-protected with role/permission checks; STK initiation has no user authentication, and the webhook uses a shared URL token, source-IP filter, and initiated-request correlation rather than user bearer auth or provider signature verification. RLS is partial and deployment role provisioning must be verified. Do not treat the repository as production-ready. See [docs/auth.md](docs/auth.md) and [docs/SECURITY.md](docs/SECURITY.md).
 
 ## 8. Repository Structure
 
@@ -183,7 +183,7 @@ In `development` and `test`, source-IP filtering is skipped for local testing. O
 
 PostgreSQL is the primary database. Numbered SQL files in [db/migrations/](db/migrations/) define the schema; they are applied in filename order with a PostgreSQL client because no migration framework/runner is configured. The schema covers rental/property records, invoices, webhook and payment processing, allocations, credits, ledger entries, outbox events, and the new `app_users` / `user_memberships` identity foundation.
 
-Normal application and system database sessions use separate URLs and roles. RLS policies are defined in migrations 0010 and 0011. Authentication-to-RLS context integration and database-backed tenant-isolation proof remain incomplete. Read [docs/DATABASE.md](docs/DATABASE.md) and [docs/SECURITY.md](docs/SECURITY.md) before working with database roles or migrations.
+Normal application and system database sessions use separate URLs and roles. RLS policies are defined in migrations 0010 and 0011. Authenticated-to-RLS integration covers selected user-scoped business routes; route and deployment-role coverage remains incomplete. Read [docs/auth.md](docs/auth.md), [docs/DATABASE.md](docs/DATABASE.md), and [docs/SECURITY.md](docs/SECURITY.md) before working with database roles or migrations.
 
 ## 13. Running the Tests
 
@@ -202,7 +202,7 @@ $env:DEBUG = 'false'
 .\venv\Scripts\python.exe -m pytest -q app/Tests/integration
 ```
 
-Integration tests may require the configured PostgreSQL and Redis services; Kafka-related tests may require Kafka. Some database integration tests use `SYSTEM_DATABASE_URL`, so use a dedicated disposable test database. Security tests include mocked identity and RLS-context checks; they do not prove PostgreSQL RLS isolation. Pytest configuration is in [pytest.ini](pytest.ini). There is no separate `docs/TESTING.md` in the repository.
+Integration tests may require the configured PostgreSQL and Redis services; Kafka-related tests may require Kafka. Some database integration tests use `SYSTEM_DATABASE_URL`, so use a dedicated disposable test database. Security tests include mocked identity and RLS-context checks plus PostgreSQL-backed RLS isolation tests. Pytest configuration is in [pytest.ini](pytest.ini); see [docs/TESTING.md](docs/TESTING.md) for current test setup and commands.
 
 ## 14. API
 
@@ -216,7 +216,7 @@ The current FastAPI routes registered in `app/main.py` are:
 | `GET` | `/api/v1/bff/landlord/me` | Authenticated landlord context and property count |
 | `GET` | `/api/v1/bff/caretaker/me` | Authenticated caretaker context |
 
-These are the implemented route groups, not a complete property-management API. OpenAPI documentation is served by FastAPI at `/docs` when the API is running. There is no separate `docs/API.md` currently.
+These are the implemented route groups, not a complete property-management API. OpenAPI documentation is served by FastAPI at `/docs` when the API is running; [docs/API.md](docs/API.md) records the current API contract.
 
 ## 15. Development Workflow
 
@@ -230,17 +230,22 @@ Financial workflow changes need integration and concurrency coverage because cor
 
 | Document | Purpose |
 | --- | --- |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture and component responsibilities |
-| [docs/DATABASE.md](docs/DATABASE.md) | Database connections, schema, constraints, and data relationships |
-| [docs/SECURITY.md](docs/SECURITY.md) | Security controls, status, and known gaps |
-| [docs/PRD.md](docs/PRD.md) | Product requirements and roadmap |
-| [docs/README.md](docs/README.md) | Documentation index |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | System architecture and component responsibilities |
+| [DOMAIN.md](DOMAIN.md) | Implemented business concepts, financial invariants, and unresolved domain decisions |
+| [DATABASE.md](DATABASE.md) | Database connections, schema, constraints, and data relationships |
+| [auth.md](auth.md) | Authentication, authorization, role/scope rules, and current route matrix |
+| [SECURITY.md](SECURITY.md) | Security controls, status, and known gaps |
+| [API.md](API.md) | Implemented HTTP API contracts and behavior |
+| [TESTING.md](TESTING.md) | Local test commands and integration-test setup |
+| [decisions.md](decisions.md) | Accepted technical decisions and conditions for revisiting them |
+| [PRD.md](PRD.md) | Product requirements and roadmap |
+| [README.md](README.md) | Documentation index |
 
-`docs/TESTING.md`, `docs/API.md`, `docs/DEVELOPMENT.md`, `docs/DEPLOYMENT.md`, and `docs/DECISIONS.md` are not present in this repository.
+`docs/DEVELOPMENT.md` and `docs/DEPLOYMENT.md` are not present in this repository.
 
 ## 17. Roadmap
 
-The current Phase 3 security work is moving from provider-token verification and trusted local identity lookup toward a complete identity lifecycle, broad RBAC and ownership enforcement, and authenticated tenant/landlord context integration with RLS. The project also needs real PostgreSQL cross-landlord isolation tests. Later product work includes stable core API contracts, frontend integration, notification flows, and reliability/production hardening as described in the PRD and architecture documents. These are not represented as completed features here.
+The current Phase 3 security work extends the implemented provider-token verification, trusted local identity lookup, selected route RBAC, and transaction-local RLS integration toward a complete identity lifecycle, broad resource ownership enforcement, and verified database-role configuration. PostgreSQL cross-landlord isolation tests exist, but route and deployment coverage still need extension. Later product work includes stable core API contracts, frontend integration, notification flows, and reliability/production hardening as described in the PRD and architecture documents. These are not represented as completed features here.
 
 ## 18. Important Engineering Invariants
 

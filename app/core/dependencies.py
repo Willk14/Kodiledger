@@ -172,11 +172,15 @@ def get_invoice_allocation_service(
     payment_credit_repository: PaymentCreditRepository = Depends(
         get_system_payment_credit_repository
     ),
+    payment_transaction_repository: PaymentTransactionRepository = Depends(
+        get_system_payment_transaction_repository
+    ),
 ) -> InvoiceAllocationService:
     return InvoiceAllocationService(
         invoice_repository=invoice_repository,
         payment_allocation_repository=payment_allocation_repository,
         payment_credit_repository=payment_credit_repository,
+        payment_transaction_repository=payment_transaction_repository,
     )
 
 

@@ -100,8 +100,6 @@ class UnassignedPaymentRepository:
         result = await self.db.execute(
             select(
                 table.c.id,
-                table.c.landlord_id,
-                table.c.raw_webhook_id,
                 table.c.mpesa_receipt_number,
                 table.c.amount,
                 table.c.payer_phone,
@@ -111,7 +109,7 @@ class UnassignedPaymentRepository:
             )
             .where(
                 table.c.landlord_id == landlord_id,
-
+                table.c.is_resolved.is_not(True),
             )
             .order_by(table.c.created_at.desc())
         )

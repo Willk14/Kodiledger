@@ -1,7 +1,7 @@
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,7 +19,7 @@ class PaymentAllocationRepository:
         invoice_id: str,
         amount: Decimal,
         status: str = "ALLOCATED",
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         from app.models.payment_allocation import PaymentAllocation
 
         stmt = (
@@ -55,17 +55,27 @@ class PaymentAllocationRepository:
         if row:
             return dict(row)
 
-        existing = await self.get(
-            payment_transaction_id=payment_transaction_id,
-            invoice_id=invoice_id,
-        )
+        # The caller must treat a uniqueness conflict as an existing
+        # allocation, never as a newly created financial effect.
+        return None
 
-        if not existing:
-            raise RuntimeError(
-                "Payment allocation was not created and could not be found."
+    async def get_total_allocated_for_payment(
+        self,
+        *,
+        payment_transaction_id: str,
+    ) -> Decimal:
+        from app.models.payment_allocation import PaymentAllocation
+
+        result = await self.db.execute(
+            select(
+                func.coalesce(func.sum(PaymentAllocation.amount), 0)
+            ).where(
+                PaymentAllocation.payment_transaction_id
+                == payment_transaction_id,
+                PaymentAllocation.status == "ALLOCATED",
             )
-
-        return existing
+        )
+        return Decimal(str(result.scalar_one()))
 
     async def get(
         self,

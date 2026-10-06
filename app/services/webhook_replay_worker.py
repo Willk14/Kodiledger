@@ -68,7 +68,12 @@ class WebhookReplayWorker:
         ledger = LedgerRepository(db)
         unassigned = UnassignedPaymentRepository(db)
         outbox = OutboxEventService(OutboxEventRepository(db))
-        allocation_service = InvoiceAllocationService(invoices, allocations, credits)
+        allocation_service = InvoiceAllocationService(
+            invoice_repository=invoices,
+            payment_allocation_repository=allocations,
+            payment_credit_repository=credits,
+            payment_transaction_repository=transactions,
+        )
         reconciliation = ReconciliationService(
             tenant_repository=tenants,
             payment_transaction_repository=transactions,

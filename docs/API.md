@@ -7,9 +7,9 @@ The source of truth for the current surface is the running FastAPI application's
 ## 1. API Principles
 
 - **IMPLEMENTED:** HTTP routes are under `/api/v1` except the root health response. JSON request validation uses Pydantic. The API layer delegates payment callbacks and STK initiation to services.
-- **PARTIAL:** OIDC bearer authentication, database-backed membership authorization, and landlord RLS context are wired to the two BFF context routes. The payment initiation and webhook routes have separate trust requirements and are not protected by those user dependencies.
+- **PARTIAL:** OIDC bearer authentication and database-backed membership authorization protect selected BFF and business routes. User-scoped business routes use transaction-local landlord RLS context. STK initiation, provider callbacks, and admin status operations use separate trust boundaries; see [auth.md](auth.md).
 - **PARTIAL:** PostgreSQL is authoritative for payment processing and financial records. Callback processing uses a transaction and receipt uniqueness; Redis is a coordination/rate-limit layer.
-- No public pagination, filtering, sorting, standard idempotency-key header, or uniform error envelope is currently implemented.
+- **LEDGER exception:** `GET /api/v1/ledger` supports bounded offset pagination and documented filters. Other collection routes do not yet share a general pagination/filter convention. There is no standard idempotency-key header or uniform error envelope.
 
 ## 2. Base URL and Versioning
 
@@ -17,7 +17,7 @@ The registered version prefix is `/api/v1`; deployment host and scheme are envir
 
 ## 3. Authentication
 
-**IMPLEMENTED for protected BFF routes:** send `Authorization: Bearer <OIDC access token>`. KodiLedger verifies a signed JWT using the configured issuer, audience, JWKS endpoint, and explicit asymmetric algorithm allowlist (`RS256` by default; configured values are restricted to asymmetric algorithms). Required claims are `iss`, `sub`, `aud`, `exp`, and `iat`; signature, expiry, issuer, audience, and issued-at are checked. Issuer and JWKS URLs must use HTTPS.
+**IMPLEMENTED on protected routes:** send `Authorization: Bearer <OIDC access token>`. KodiLedger verifies a signed JWT using the configured issuer, audience, JWKS endpoint, and explicit asymmetric algorithm allowlist (`RS256` by default; configured values are restricted to asymmetric algorithms). Required claims are `iss`, `sub`, `aud`, `exp`, and `iat`; signature, expiry, issuer, audience, and issued-at are checked. Issuer and JWKS URLs must use HTTPS. For the complete route matrix and system/provider exceptions, see [auth.md](auth.md).
 
 The verified `(iss, sub)` is resolved to an active local `app_users` record and exactly one active membership. Role and scope claims supplied by the token are ignored. KodiLedger does not issue login tokens; identity provider login/token issuance is external. No credential or live OIDC values belong in this document.
 
@@ -29,10 +29,10 @@ The code defines `LANDLORD`, `CARETAKER`, `TENANT`, `ADMIN`, and `SYSTEM`. The f
 
 | Role | Current API route access | Scope resolution |
 |---|---|---|
-| LANDLORD | `/api/v1/bff/landlord/me` (`PROPERTY_READ`); property reads (`PROPERTY_READ`); unit reads and writes (`UNIT_READ` / `UNIT_WRITE`); tenant reads and create (`TENANT_READ` / `TENANT_WRITE`); invoice reads and create (`INVOICE_READ` / `INVOICE_WRITE`) | Active membership's landlord ID; resource queries are constrained by ownership filters and PostgreSQL RLS |
+| LANDLORD | Landlord context, property, unit, tenant, invoice, payment/allocation/credit read, ledger, and unassigned-payment routes, subject to each route's permission | Active membership's landlord ID; resource queries are constrained by ownership filters and PostgreSQL RLS |
 | CARETAKER | `/api/v1/bff/caretaker/me`; unit and tenant reads (`UNIT_READ` / `TENANT_READ`) | Active membership's landlord ID; resource queries are constrained by ownership filters and PostgreSQL RLS |
 | TENANT | `GET /api/v1/tenants/me` requires `TENANT_READ`; no invoice route currently | Active membership's tenant and landlord IDs; tenant query is constrained by both values and PostgreSQL RLS |
-| ADMIN | No admin route | Membership must have no landlord or tenant scope |
+| ADMIN | STK unresolved request queue and status query require `PAYMENT_READ` | Membership must have no landlord or tenant scope; these routes use the trusted system DB session |
 | SYSTEM | No bearer route; used through trusted system DB dependencies | Internal trusted workflow only |
 
 Wrong role or permission returns 403. Client-supplied role or landlord IDs are not authentication authority. Broader route-by-route ownership enforcement remains incomplete.
@@ -41,7 +41,7 @@ Wrong role or permission returns 403. Client-supplied role or landlord IDs are n
 
 **IMPLEMENTED:** JSON bodies use `Content-Type: application/json`; protected routes use the Bearer authorization header. CORS allows `Authorization`, `Content-Type`, and `Idempotency-Key`, but allowing a header in CORS does not mean a route processes it.
 
-There are no implemented pagination, filtering, sorting, or general idempotency-key convention. The STK request rejects extra JSON fields. Callback schemas ignore unknown fields to tolerate provider payload extensions.
+There is no API-wide pagination, filtering, sorting, or general idempotency-key convention. The ledger collection has a route-specific bounded offset page; the STK request rejects extra JSON fields, while callback schemas ignore unknown fields to tolerate provider payload extensions.
 
 ## 6. Common Response Conventions
 
@@ -90,6 +90,16 @@ This is a shallow process response, not a database/dependency readiness probe. F
 ```
 
 The response is validated by `LandlordContextRead`. Errors: 401 for missing/invalid bearer credentials, 403 for missing/invalid landlord membership or permission, 503 for authentication dependency failures, and 500 for unexpected database/server failures. The endpoint has no request body or path parameter; extra query values such as `landlord_id` and `role` do not change the authenticated scope. There are no landlord CRUD endpoints in this contract.
+
+### IMPLEMENTED — caretaker context
+
+`GET /api/v1/bff/caretaker/me` requires a valid Bearer token, the `CARETAKER` role, and `UNIT_READ`. It returns the authenticated membership context without reading business rows or opening a database session. The landlord scope is sourced from the verified local membership; query parameters cannot override it.
+
+| Method and path | Success | Errors |
+|---|---|---|
+| `GET /api/v1/bff/caretaker/me` | 200, JSON object containing `user_id`, `role`, and `landlord_id` (all strings) | 401 for missing/invalid bearer credentials; 403 for a missing/invalid caretaker membership or permission |
+
+There are no caretaker CRUD endpoints. Caretaker unit and tenant reads are documented under the Unit and Tenant APIs; the context endpoint does not itself grant resource access.
 
 ## 10. Property API
 
@@ -210,10 +220,10 @@ Allocation and payment-credit detail routes also require `PAYMENT_READ` and firs
 
 | Method and path | Purpose | Success | Errors |
 |---|---|---|---|
-| `GET /api/v1/payments/{payment_id}/allocations` | List invoice allocation rows for a visible payment | 200, array of allocation objects (empty if none) | 401, 403, 404, 422 |
-| `GET /api/v1/payments/{payment_id}/credits` | List payment-credit rows created from a visible payment | 200, array of credit objects (empty if none) | 401, 403, 404, 422 |
+| `GET /api/v1/payments/{payment_id}/allocations` | List invoice allocation rows for a visible payment | 200, array of allocation objects (empty if none) | 401, 403, 404, 422, 500, 503 |
+| `GET /api/v1/payments/{payment_id}/credits` | List payment-credit rows created from a visible payment | 200, array of credit objects (empty if none) | 401, 403, 404, 422, 500, 503 |
 
-Allocation objects expose `id`, `payment_transaction_id`, `invoice_id`, `amount`, `status`, `created_at`, and `reversed_at`; allocation states are `ALLOCATED` and `REVERSED`. Credit objects expose `id`, `payment_transaction_id`, `tenant_id`, `amount`, `status`, `created_at`, and `applied_at`; credit states are `AVAILABLE`, `APPLIED`, `REFUNDED`, and `CANCELLED`. Monetary values serialize as Decimal strings. These endpoints are read-only; no allocation or credit mutation endpoint is registered.
+Allocation objects expose `id`, `payment_transaction_id`, `invoice_id`, `amount`, `status`, `created_at`, and `reversed_at`; allocation states are `ALLOCATED` and `REVERSED`. Credit objects expose `id`, `payment_transaction_id`, `tenant_id`, `amount`, `status`, `created_at`, and `applied_at`; credit states are `AVAILABLE`, `APPLIED`, `REFUNDED`, and `CANCELLED`. Monetary values serialize as Decimal strings. These endpoints are read-only. There is no generic `POST /api/v1/allocations`, `GET /api/v1/allocations`, or `GET /api/v1/allocations/{allocation_id}` route. Allocation writes are part of the existing unassigned-payment resolution command below; the API does not expose `InvoiceAllocationService` directly or let a caller select an arbitrary payment/invoice pair.
 
 ## 15. M-Pesa Webhook API
 
@@ -249,29 +259,39 @@ Accepted callbacks normally return HTTP 200 with service result JSON. Invalid/mi
 
 ## 16. Allocation API
 
-**IMPLEMENTED read-only API / partial backend capability:** callback reconciliation and unassigned-payment resolution allocate received payment to invoices, including partial allocation. `GET /api/v1/payments/{payment_id}/allocations` exposes persisted allocation rows in the caller's payment scope. There is no general allocation CRUD route; writes continue through the existing allocation business service.
+**IMPLEMENTED API contract:** allocation reads are payment-scoped through `GET /api/v1/payments/{payment_id}/allocations`; the only public financial allocation command is `POST /api/v1/unassigned-payments/{payment_id}/resolve`. Callback reconciliation and this resolution workflow call the internal allocation service. No generic allocation CRUD routes are registered, and the service is not exposed directly to HTTP callers.
 
 ## 17. Unassigned Payment API
 
-**IMPLEMENTED — landlord unassigned-payment review and resolution:** these routes use the normal application session and RLS. A landlord with `PAYMENT_ASSIGN` can list unresolved receipts in their scope and resolve one by selecting an active tenant in that same landlord scope. Resolution locks the unassigned-payment row, attaches the tenant to its payment transaction, runs the existing invoice allocation/credit rules, records the ledger credit and idempotent `PAYMENT_PROCESSED` outbox event, updates processing state when the row is still `UNASSIGNED`, and records the resolving user, unit, and database timestamp. These effects commit in one PostgreSQL transaction; conflicts and failures roll it back. The outbox application role access is restricted to SELECT/INSERT of payment-transaction events whose transaction belongs to the current landlord RLS context.
+**IMPLEMENTED — landlord unassigned-payment review and resolution:** a successful callback is unassigned when reconciliation finds no active tenant matching the payer phone under the callback's landlord scope. The landlord chooses the intended active tenant; the server verifies that tenant is in the same landlord scope and derives its unit. The existing allocator then selects that tenant's oldest unpaid invoice. It applies at most the lesser of payment funds available and the invoice's remaining balance; overpayment becomes a payment credit, which is automatically applied FIFO to further unpaid invoices. If there is no unpaid invoice, the remaining available payment amount becomes a credit. Existing credits are automatically applied FIFO when a new invoice is created. Credit applications are immutable records, invoice paid state reflects both payment allocations and credit applications, and the payment credit read response includes its original `amount` and remaining `available_amount`. Refund and cancellation APIs are not implemented.
+
+Both routes use the normal application session and RLS. They require `LANDLORD` plus `PAYMENT_ASSIGN`. The request accepts only `tenant_id`; unknown fields are rejected. The server derives landlord, authoritative payment amount/status, tenant unit, invoice, allocation, ledger values, and outbox payload from authenticated scope and PostgreSQL records. The list returns unresolved rows only (`is_resolved` false or NULL), with `id`, `mpesa_receipt_number`, `amount`, `payer_phone`, `payer_name`, `invalid_account_reference`, and `created_at`; it omits the internal raw-webhook ID. No pagination, detail route, or generic CRUD is implemented.
+
+The resolver locks the unassigned-payment row, then locks the payment transaction. The existing allocator uses the same payment lock before locking the selected invoice. Webhook reconciliation does not acquire an unassigned-payment lock after acquiring a payment lock. This gives resolution the order unassigned payment → payment transaction → invoice, while other allocation paths use payment transaction → invoice. The resolver attaches the tenant, reuses existing allocation/credit rules, records one full-payment ledger credit and idempotent `PAYMENT_PROCESSED` outbox event, updates processing state when the row is still `UNASSIGNED`, and records the resolving user, unit, and database timestamp. Reconciliation/resolution do not commit independently: allocation, credit, invoice state, ledger, outbox, payment assignment, processing state, and resolution commit in one PostgreSQL transaction; any failure rolls the complete write set back. The outbox application-role access is restricted to SELECT/INSERT of payment-transaction events whose transaction belongs to the current landlord RLS context.
 
 | Method and path | Purpose | Success | Errors |
 |---|---|---|---|
 | `GET /api/v1/unassigned-payments` | List unresolved receipts in the authenticated landlord scope | 200, array of unassigned payment objects | 401, 403, 500, 503 |
 | `POST /api/v1/unassigned-payments/{payment_id}/resolve` | Resolve a receipt for an active same-landlord tenant and apply normal allocation/credit, ledger, and outbox processing | 200, resolution result with allocation outcome | 401, 403, 404, 409, 422, 500, 503 |
 
-The request body is `{"tenant_id": "<UUID>"}`. A missing/out-of-scope payment or inactive/out-of-scope tenant returns 404. Already-resolved or inconsistent financial records return 409. Resolving a payment does not guarantee an invoice allocation: the existing allocator may return `UNALLOCATED` when the tenant has no unpaid invoice.
+The request body is exactly `{"tenant_id": "<UUID>"}`. `landlord_id`, payment or invoice IDs, amounts, payment/allocation status, unit ownership, ledger values, and outbox state cannot be supplied or overridden by the client. A missing/out-of-scope payment or inactive/out-of-scope tenant returns 404. Already-resolved or inconsistent financial records return 409. Sequential and concurrent repeated resolve requests return one success and deterministic 409 conflict(s); they create no duplicate allocation, credit, ledger entry, or outbox event. There is no generic idempotency-key header or success-response replay. The response schema is `UnassignedPaymentResolutionRead` (`id`, `payment_transaction_id`, `mpesa_receipt_number`, `tenant_id`, `unit_id`, `amount`, `allocation`, `outbox_event_id`, `resolved_at`). Resolution does not guarantee an invoice allocation: the existing allocator may return `UNALLOCATED` when the tenant has no unpaid invoice.
 
 ## 18. Ledger API
 
-**IMPLEMENTED — landlord read-only ledger history:** both routes require landlord role and `PAYMENT_READ`, use the normal application session with RLS, and constrain queries to the authenticated landlord. A foreign or missing entry returns 404. No ledger mutation or reversal route is exposed.
+**IMPLEMENTED — landlord read-only ledger history:** both routes require `LANDLORD` plus `PAYMENT_READ`, use the normal application session with RLS, and constrain every query to the authenticated landlord. A foreign or missing entry returns 404. No ledger mutation or reversal route is exposed.
 
 | Method and path | Purpose | Success | Errors |
 |---|---|---|---|
-| `GET /api/v1/ledger` | List ledger entries in the current landlord scope, newest first | 200, array of ledger entry objects | 401, 403 |
-| `GET /api/v1/ledger/{entry_id}` | Read one ledger entry in the current landlord scope | 200, ledger entry object | 401, 403, 404, 422 |
+| `GET /api/v1/ledger` | List ledger entries in the current landlord scope, newest first | 200, `LedgerEntryPage` | 401, 403, 422, 500 |
+| `GET /api/v1/ledger/{entry_id}` | Read one ledger entry in the current landlord scope | 200, `LedgerEntryRead` | 401, 403, 404, 422, 500 |
 
-Responses expose ledger, unit, tenant, invoice, and payment-transaction IDs where present, receipt number, entry type, amount, payment method, status, description, and creation time. Payer phone, payer name, merchant request ID, account reference, and landlord ID are omitted. Amounts serialize as Decimal strings.
+`GET /ledger` supports `limit` (default 50, maximum 100), `offset` (default 0), and optional exact filters `payment_transaction_id`, `tenant_id`, `invoice_id`, `unit_id`, `property_id`, and `receipt`, plus inclusive `created_from` and `created_to` timestamps. Timestamps must include a timezone offset and `created_from` must not exceed `created_to`. Landlord ID is always derived from the authenticated membership; a `landlord_id` query value is not an authorization filter. Property filtering follows the ledger entry's unit relationship. There are no amount filters or property ID fields in the ledger response.
+
+The page response contains `items`, `total`, `limit`, and `offset`. Rows are ordered by `created_at DESC, id DESC`; offset pages are deterministic for a fixed dataset, but concurrent inserts can shift later pages. Filtering and pagination are evaluated inside the landlord-scoped query and remain subject to RLS.
+
+`LedgerEntryRead` exposes ledger, unit, tenant, invoice, and payment-transaction IDs where present, receipt number, entry type, amount, payment method, status, description, and `created_at`. Payer phone, payer name, merchant request ID, account reference, and landlord ID are omitted. Amounts serialize as Decimal strings. The timestamp is when the ledger row was created, not a provider event-time field.
+
+The schema allows `CREDIT` and `DEBIT` entry types and several payment statuses. Current payment reconciliation and unassigned-payment resolution create a single completed `CREDIT` for the full receipt and link it to the payment transaction; they do not create separate ledger rows for invoice allocation or tenant credit application. `invoice_id` is nullable and these current ledger writers leave it unset. Receipt is unique when non-null. No reversal/correction record workflow is implemented. The API has GET routes only; underlying database policies permit scoped updates, so database-level immutability should not be inferred from the read-only HTTP boundary.
 
 ## 19. Webhook / Event Architecture
 
@@ -280,6 +300,8 @@ For matched callback payments, the verified path is: HTTP callback → trusted s
 ## 20. Idempotency
 
 **IMPLEMENTED in callback processing:** Redis provides a fast-path receipt lock; PostgreSQL's unique receipt claim is authoritative for preventing duplicate financial processing. Payment records and reconciliation effects are coordinated within the PostgreSQL transaction. Outbox event idempotency keys are unique; worker delivery can still repeat across the publish/mark crash window, so downstream consumers would need deduplication.
+
+**IMPLEMENTED for unassigned-payment resolution:** the service locks the unresolved payment and its transaction; once resolved, a repeated command receives HTTP 409. This resource-state check prevents duplicate allocation, credit, ledger, processing, and outbox effects. The API does not claim same-success response replay and does not accept an idempotency-key header.
 
 **NOT IMPLEMENTED:** STK initiation does not accept a client idempotency key. Redis state is not the financial source of truth.
 
@@ -294,7 +316,7 @@ ACID describes the PostgreSQL transaction boundary; it does not make a multi-sys
 - **Isolation:** PostgreSQL's configured default isolation is used (normally `READ COMMITTED`); the API does not promise serializable execution or a snapshot spanning multiple requests. Unit creation locks the parent property while counting and inserting. Unique database constraints arbitrate duplicate invoice numbers and M-Pesa receipts under concurrency.
 - **Durability:** A successful database-backed mutation response is sent only after PostgreSQL reports a commit. Survival of host/storage failures still depends on the deployed PostgreSQL durability configuration and backups, which are outside this API contract.
 
-The callback inbox row commits first so the provider payload survives a process crash or a later reconciliation rollback. Financial processing then runs in one PostgreSQL transaction: receipt claim, normalized transaction, allocation/credit or unassigned-payment record, ledger effects when matched, processing state, inbox completion, and matched-payment outbox row commit together or roll back together. Failed-provider callbacks are recorded and marked complete without creating a successful payment transaction. Invoice allocation locks the oldest unpaid invoice row. Failed successful-payment callbacks remain pending for the webhook replay worker, which claims rows with `SKIP LOCKED`, recovers stale claims, retries with capped backoff, and retains the last error; after ten failed attempts the row is left for operator review. The outbox row is atomic with the financial effects, but Kafka publishing happens after commit and may be delivered more than once; downstream consumers must deduplicate. A database rollback cannot undo an external payment already executed by Safaricom.
+The callback inbox row commits first so the provider payload survives a process crash or a later reconciliation rollback. Financial processing then runs in one PostgreSQL transaction: receipt claim, normalized transaction, allocation/credit or unassigned-payment record, ledger effects when matched, processing state, inbox completion, and matched-payment outbox row commit together or roll back together. Failed-provider callbacks are recorded and marked complete without creating a successful payment transaction. Allocation serializes by locking the tenant with `FOR NO KEY UPDATE`, then the payment transaction, then the selected invoice. It reads committed allocation and credit totals while holding those locks; persisted payment amount less allocations and credits is the available payment balance. The tenant lock remains compatible with the key-share lock a concurrent payment insert takes for its tenant foreign key, avoiding a lock-upgrade deadlock while still serializing tenant financial writers. When no unpaid invoice exists, the allocator records the remaining available payment amount as a tenant payment credit without creating an invoice allocation. Failed successful-payment callbacks remain pending for the webhook replay worker, which claims rows with `SKIP LOCKED`, recovers stale claims, retries with capped backoff, and retains the last error; after ten failed attempts the row is left for operator review. The outbox row is atomic with the financial effects, but Kafka publishing happens after commit and may be delivered more than once; downstream consumers must deduplicate. A database rollback cannot undo an external payment already executed by Safaricom.
 
 STK Push is an external initiation call, not a PostgreSQL transaction. HTTP 200 means the provider initiation returned successfully; it does not mean the payment completed or that any database financial effect committed. The callback is the source of confirmed payment state. On callback processing failures, the route returns HTTP 200 with `ResultCode: 1`, while the committed inbox record is retained for internal replay. Run `python -m app.workers.webhook_replay` alongside the API to process pending callbacks; callbacks that exhaust ten attempts remain stored with their last error for operator review.
 
@@ -310,7 +332,7 @@ Protected landlord flow: verified OIDC identity → unique active local membersh
 
 ## 23. Pagination, Filtering and Search
 
-**PLANNED:** no registered route currently implements pagination, filtering, sorting, or search. Do not build client dependencies on assumed query parameters.
+**PARTIAL:** `GET /api/v1/ledger` implements route-specific offset pagination and exact filters documented in the Ledger API section. Other collections do not have shared pagination, filtering, sorting, or search conventions. Do not assume the ledger query parameters apply elsewhere.
 
 ## 24. OpenAPI
 
@@ -321,14 +343,15 @@ FastAPI generates `/openapi.json` from registered routes, Pydantic request/respo
 | Domain | Current | Target | Notes |
 |---|---|---|---|
 | Authentication | IMPLEMENTED foundation | Stable identity integration | External OIDC issuance; membership controls local role/scope |
-| Landlord | PARTIAL `/bff/landlord/me` | Landlord workflows | No CRUD |
+| Landlord | IMPLEMENTED `/bff/landlord/me` | Landlord workflows | No CRUD |
+| Caretaker | IMPLEMENTED `/bff/caretaker/me`; scoped unit and tenant reads | Caretaker workflows | No writes or assigned-unit scope model |
 | Properties | PARTIAL landlord list/read | Create/update/deactivate if specified | List/get use authenticated landlord scope and RLS; mutations have no route |
 | Units | IMPLEMENTED landlord/caretaker reads; landlord create/update | Unit list/detail/create/update | Scoped through property and landlord; create updates the property's unit count |
 | Tenants | IMPLEMENTED scoped list/detail/create and tenant self-read | Tenant management and self-service | Landlord/caretaker reads and landlord create use RLS; tenant self-read is membership scoped |
 | Invoices | IMPLEMENTED landlord list/read/create | Invoice list/detail/create; tenant self-read and lifecycle mutations | Landlord-scoped with RLS; total is database-generated; create verifies tenant/unit ownership |
 | Payments | IMPLEMENTED STK Push initiation, admin status query, and landlord/tenant transaction reads | Payment history and explicit business actions | STK initiation remains unauthenticated; history is scope-filtered; query does not reconcile financial effects |
-| Allocations and payment credits | IMPLEMENTED scoped read routes; writes remain internal | Payment-scoped allocation/credit listing | `PAYMENT_READ`, payment ownership check, and RLS |
-| Unassigned payments | IMPLEMENTED landlord review and resolution | `GET /unassigned-payments`, `POST /unassigned-payments/{id}/resolve` | Landlord scope, `PAYMENT_ASSIGN`, active same-landlord tenant, RLS |
+| Allocations and payment credits | IMPLEMENTED scoped reads; financial writes are internal to reconciliation/resolution | `GET /payments/{payment_id}/allocations`, `GET /payments/{payment_id}/credits` | `PAYMENT_READ`, payment ownership check, and RLS |
+| Unassigned payments | IMPLEMENTED landlord review and resolution command | `GET /unassigned-payments`, `POST /unassigned-payments/{payment_id}/resolve` | `LANDLORD` + `PAYMENT_ASSIGN`, active same-landlord tenant, RLS; atomic financial write set |
 | Ledger | IMPLEMENTED landlord-scoped reads; writes remain internal | `GET /ledger`, `GET /ledger/{entry_id}` | `PAYMENT_READ`, landlord scope, and RLS; no mutation route |
 | Webhooks | PARTIAL M-Pesa callback | Authenticated/validated provider integration | No sender authentication currently visible |
 

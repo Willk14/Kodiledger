@@ -16,7 +16,6 @@ class UnassignedPaymentResolve(BaseModel):
 
 class UnassignedPaymentRead(BaseModel):
     id: UUID
-    raw_webhook_id: UUID | None
     mpesa_receipt_number: str
     amount: Decimal
     payer_phone: str

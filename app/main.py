@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.api.v1.endpoints.webhooks import router as webhooks_router
 from app.api.v1.endpoints.payments import router as payments_router
@@ -18,6 +23,28 @@ from app.api.v1.endpoints.Bff.caretaker import (
     router as caretaker_bff_router,
 )
 from app.core.config import settings
+from app.core.database import engine, system_engine
+
+
+async def _check_database_connection(database_engine: AsyncEngine, name: str) -> None:
+    try:
+        async with database_engine.connect() as connection:
+            await connection.execute(text("SELECT 1"))
+    except Exception:
+        # Do not include the connection URL in startup errors or logs.
+        raise RuntimeError(f"Could not connect to the {name} database.") from None
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    try:
+        # Validate both configured PostgreSQL roles before serving requests.
+        await _check_database_connection(engine, "application")
+        await _check_database_connection(system_engine, "system")
+        yield
+    finally:
+        await engine.dispose()
+        await system_engine.dispose()
 
 
 # ============================================================
@@ -31,6 +58,7 @@ app = FastAPI(
         "& Property Management Engine"
     ),
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 

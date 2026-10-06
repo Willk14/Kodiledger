@@ -192,6 +192,8 @@ async def get_payment_transaction(
         401: {"description": "Authentication required."},
         403: {"description": "Payment read access or membership scope is required."},
         404: {"description": "Payment transaction not found in this scope."},
+        500: {"description": "The payment-allocation query failed."},
+        503: {"description": "Authentication or database context is unavailable."},
     },
 )
 async def list_payment_allocations(
@@ -220,6 +222,8 @@ async def list_payment_allocations(
         401: {"description": "Authentication required."},
         403: {"description": "Payment read access or membership scope is required."},
         404: {"description": "Payment transaction not found in this scope."},
+        500: {"description": "The payment-credit query failed."},
+        503: {"description": "Authentication or database context is unavailable."},
     },
 )
 async def list_payment_credits(

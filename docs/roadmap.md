@@ -1,8 +1,44 @@
 # M-Pesa STK Push Sandbox Callback Roadmap
 
+## API contract stabilization before Supabase
+
+Status: **Complete for the currently implemented API surface and regression-verified** (2026-10-06). This is a stability checkpoint for database integration, not a permanent freeze; planned workflows remain open for future design.
+
+- Audited registered FastAPI routes against `docs/API.md` and the generated OpenAPI schema. The caretaker context route was missing its endpoint-level contract and is now documented.
+- Added an OpenAPI route-manifest test that makes additions/removals/method changes explicit, including the absence of a generic `/api/v1/allocations` endpoint.
+- The PostgreSQL race test exposed a repeatable deadlock when separate successful payments for one tenant simultaneously upgraded foreign-key key-share locks to a stronger tenant lock. The tenant serialization now uses `FOR NO KEY UPDATE`, preserving mutual exclusion while avoiding that upgrade conflict. The focused race test passes.
+- Contract baseline: current routes, request/response schemas, auth boundaries, and financial behaviors remain unchanged during the first Supabase database integration. Any required API change must update OpenAPI checks and synchronized docs deliberately.
+- The Supabase development-project migration and connection rehearsal was completed on 2026-10-06. The next milestone is role/RLS verification and an isolated security/integration test run against the development project before any data is moved. Keep OIDC and API behavior unchanged during that milestone.
+- Decision 8 records the trade-offs and guardrails in `docs/decisions.md`.
+
+### Supabase development database preparation
+
+- **Compatibility issue found and fixed:** migration `0011_rls_role_hardening.sql` granted `CONNECT` to a hard-coded local database name (`kodiflow_db`). It now grants access to `current_database()`, which supports Supabase's project database name without changing role scope.
+- Migrations are manual SQL files; this repository has no migration runner/history table. Apply `db/migrations/*.sql` in numeric order to a new, empty development project, using a privileged project connection only for schema changes.
+- Provision two separate SQL login roles before migrations that grant/revoke privileges: `kodiflow_app` (must not have `BYPASSRLS`) and `kodiflow_system` (trusted webhook/worker role with `BYPASSRLS`). Set each password separately in a secure prompt/secret store. Never use a Supabase API `service_role` key as a PostgreSQL connection string.
+- Migration `0011` creates `kodiflow_system` without a password, and the migration set does not create `kodiflow_app`; this provisioning gap must be handled before applying the SQL. Confirm that the Supabase project database owner can create/configure the required custom roles before migration rehearsal.
+- Supabase projects include Data API roles and grants in addition to PostgreSQL login roles. Before enabling any Data API access, inspect grants and default privileges for `anon`, `authenticated`, and `service_role`; KodiLedger currently expects all business access through FastAPI and does not use Supabase Data API.
+- Select a database connection mode from the backend host's IP support: direct for persistent service hosts with IPv6, or Supabase session pooler for IPv4-only hosts. Use TLS and verify pooler compatibility before setting production connection-pool options.
+- After role setup, apply the migration chain on the empty dev project, verify database name, migration results, role attributes, table grants, RLS/`FORCE RLS`, and cross-landlord policies, then run the PostgreSQL security/integration suite against that project before moving any data.
+- **Development rehearsal completed (2026-10-06):** created the `KodiLedger-dev` Supabase project and applied `db/migrations/0001` through `0017` in numeric order using the SQL Editor. Created `kodiflow_app` as a login role with `NOBYPASSRLS`; migration `0011` created `kodiflow_system` with its intended `BYPASSRLS` capability. Applied the least-privilege table grants and restrictions from the RLS test setup. No application data was moved.
+- **Connection mode:** used the shared Session pooler on port `5432` for the local IPv4 development environment. Pooler logins use the role and project reference as the username. Both role passwords were set privately through `psql`'s `\\password` command; never put them in docs, screenshots, SQL Editor queries, or chat.
+- **Async SQLAlchemy TLS setting:** use `?ssl=require` on `postgresql+asyncpg` URLs. The `sslmode=require` option is passed as an unsupported keyword by SQLAlchemy's asyncpg dialect and fails with `connect() got an unexpected keyword argument 'sslmode'`. See [asyncpg connection options](https://magicstack.github.io/asyncpg/current/api/index.html) and [SQLAlchemy's asyncpg dialect](https://docs.sqlalchemy.org/en/20/dialects/postgresql.html#connect-string).
+- **Connection verification completed (2026-10-06):** `kodiflow_app` authenticated through the Session pooler and returned `current_user = kodiflow_app`, `current_database = postgres`. After correcting the asyncpg SSL URL option and matching the rotated app-role password in the ignored local `.env`, Uvicorn reported `Application startup complete`; its lifespan executes `SELECT 1` through both application and system engines. This confirms connectivity only; role/RLS policy verification and PostgreSQL integration tests against Supabase remain pending.
+- **Role verification completed (2026-10-06):** Supabase reports `kodiflow_app` as login-capable, non-superuser, and `NOBYPASSRLS`; `kodiflow_system` as login-capable, non-superuser, and `BYPASSRLS`. This matches the intended role separation. Table-level RLS and policy coverage are still to be verified.
+- Verification: the focused authorization/OpenAPI contract file passed (30 tests); the lock-order concurrency test passed; and the full suite passed (**168 passed, 1 pending-deprecation warning**) on 2026-10-06. The rerun was performed after fixing the tenant lock-upgrade deadlock and making the RLS system-session assertion fixture-scoped.
+
 ## Goal
 
 Verify one KodiLedger initiated Daraja sandbox STK request from initiation through callback receipt and durable webhook processing. An accepted STK request is not proof of payment, and status-query responses alone do not create KodiLedger payment or ledger records.
+
+## Financial domain checkpoint - 2026-10-06
+
+- The user accepted the rule that a completed payment assigned to a tenant with no unpaid invoice is recorded as an `AVAILABLE` payment credit for the remaining amount. No invoice allocation is created, and the full receipt remains in the ledger.
+- The rule is implemented in the existing `InvoiceAllocationService`, shared by matched webhook reconciliation and unassigned-payment resolution. The payment credit, ledger, outbox, and related processing state remain in the caller's PostgreSQL transaction.
+- Real PostgreSQL tests cover callback reconciliation without an invoice, unassigned-payment resolution without an unpaid invoice, and concurrent allocation of the same no-invoice payment. The full suite passed: 162 tests.
+- Decision 7 is accepted: keep original credit amounts immutable and record uses in immutable payment-credit application rows. Automatically apply credit FIFO to the oldest unpaid invoice after payment allocation/resolution and when a new invoice is created; any remainder stays available.
+- The application record, tenant/payment/credit/invoice PostgreSQL locks, invoice paid-state projection, and credit read-model `available_amount` are implemented. Refund, cancellation, expiry, and tenant-transfer policies remain undefined and unavailable. No public credit-application endpoint was added; payment and invoice workflows apply credits internally.
+- The implementation was included in the full-suite run from 2026-10-06 (**168 passed**). The test's system-session assertion now scopes its count to the two landlord fixtures created by that test, so unrelated rows left by an interrupted earlier run do not affect it.
 
 ## Confirmed in the codebase
 

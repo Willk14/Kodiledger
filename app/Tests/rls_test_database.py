@@ -183,6 +183,13 @@ async def _apply_migrations(connection: asyncpg.Connection) -> None:
             await connection.execute(
                 (MIGRATIONS / "0016_scoped_outbox_app_access.sql").read_text(encoding="utf-8")
             )
+        credit_applications_exist = await connection.fetchval(
+            "SELECT to_regclass('public.payment_credit_applications')"
+        )
+        if not credit_applications_exist:
+            await connection.execute(
+                (MIGRATIONS / "0017_payment_credit_applications.sql").read_text(encoding="utf-8")
+            )
         return
 
     for migration in sorted(MIGRATIONS.glob("*.sql")):

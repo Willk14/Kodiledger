@@ -123,7 +123,13 @@ async def create_invoice(
             values=request.model_dump(),
         )
     except DuplicateInvoiceNumberError as exc:
+        await db.rollback()
         raise _conflict() from exc
+    except Exception:
+        await db.rollback()
+        raise
     if invoice is None:
+        await db.rollback()
         raise _not_found()
+    await db.commit()
     return InvoiceRead.model_validate(invoice)

@@ -38,7 +38,12 @@ RlsSession = Annotated[AsyncSession, Depends(get_rls_db)]
     "",
     response_model=list[UnassignedPaymentRead],
     summary="List unresolved payments in the current landlord scope",
-    responses={401: {"description": "Authentication required."}, 403: {"description": "Landlord payment assignment access is required."}},
+    responses={
+        401: {"description": "Authentication required."},
+        403: {"description": "Landlord payment assignment access is required."},
+        500: {"description": "The payment query failed."},
+        503: {"description": "Authentication or database context is unavailable."},
+    },
 )
 async def list_unassigned_payments(
     principal: PaymentAssigner,
@@ -59,6 +64,8 @@ async def list_unassigned_payments(
         403: {"description": "Landlord payment assignment access is required."},
         404: {"description": "Payment or active tenant not found in this landlord scope."},
         409: {"description": "Payment has already been resolved or conflicts with financial records."},
+        500: {"description": "The financial transaction failed and was rolled back."},
+        503: {"description": "Authentication or database context is unavailable."},
     },
 )
 async def resolve_unassigned_payment(

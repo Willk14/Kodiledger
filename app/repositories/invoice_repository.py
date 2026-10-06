@@ -91,9 +91,7 @@ class InvoiceRepository:
         try:
             await self.db.flush()
             await self.db.refresh(invoice)
-            await self.db.commit()
         except IntegrityError as exc:
-            await self.db.rollback()
             original: BaseException | None = exc.orig
             constraint_name = None
             while original is not None and constraint_name is None:
@@ -177,13 +175,16 @@ class InvoiceRepository:
             text(
                 """
                 SELECT
-                    COALESCE(
-                        SUM(amount),
-                        0
-                    ) AS allocated_amount
-                FROM payment_allocations
-                WHERE invoice_id = :invoice_id
-                  AND status = 'ALLOCATED'
+                    COALESCE((
+                        SELECT SUM(amount)
+                        FROM payment_allocations
+                        WHERE invoice_id = :invoice_id
+                          AND status = 'ALLOCATED'
+                    ), 0) + COALESCE((
+                        SELECT SUM(amount)
+                        FROM payment_credit_applications
+                        WHERE invoice_id = :invoice_id
+                    ), 0) AS allocated_amount
                 """
             ),
             {
@@ -292,39 +293,20 @@ class InvoiceRepository:
                     i.is_paid,
                     i.created_at,
 
-                    COALESCE(
-                        SUM(
-                            CASE
-                                WHEN pa.status = 'ALLOCATED'
-                                THEN pa.amount
-                                ELSE 0
-                            END
-                        ),
-                        0
-                    ) AS allocated_amount
+                    COALESCE((
+                        SELECT SUM(pa.amount)
+                        FROM payment_allocations pa
+                        WHERE pa.invoice_id = i.id
+                          AND pa.status = 'ALLOCATED'
+                    ), 0) + COALESCE((
+                        SELECT SUM(pca.amount)
+                        FROM payment_credit_applications pca
+                        WHERE pca.invoice_id = i.id
+                    ), 0) AS allocated_amount
 
                 FROM invoices i
 
-                LEFT JOIN payment_allocations pa
-                    ON pa.invoice_id = i.id
-
                 WHERE i.id = :invoice_id
-
-                GROUP BY
-                    i.id,
-                    i.landlord_id,
-                    i.unit_id,
-                    i.tenant_id,
-                    i.invoice_number,
-                    i.billing_month,
-                    i.rent_amount,
-                    i.water_amount,
-                    i.garbage_amount,
-                    i.security_amount,
-                    i.due_date,
-                    i.is_paid,
-                    i.created_at
-
                 LIMIT 1
                 """
             ),

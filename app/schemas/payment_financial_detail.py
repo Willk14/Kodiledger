@@ -26,6 +26,7 @@ class PaymentCreditRead(BaseModel):
     payment_transaction_id: UUID
     tenant_id: UUID
     amount: Decimal
+    available_amount: Decimal
     status: str
     created_at: datetime
     applied_at: datetime | None

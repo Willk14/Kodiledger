@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -21,11 +23,15 @@ from sqlalchemy.engine import make_url
 from app.core.config import settings
 from app.core.database import get_db
 from app.main import app as api_app
+from app.repositories.ledger_repository import LedgerRepository
+from app.repositories.outbox_event_repository import OutboxEventRepository
 import app.security.authentication as authentication
 from app.security.dependencies import get_current_principal
 from app.security.principals import Principal
 from app.security.rls import get_rls_db, set_rls_context
 from app.security.roles import Role
+from app.services.invoice_allocation_service import AllocationConflict
+from app.services.unassigned_payment_resolution_service import UnassignedPaymentResolutionService
 from app.Tests.rls_test_database import initialize
 
 
@@ -122,12 +128,13 @@ async def rls_database(rls_test_config: dict[str, str]):
                   "receipt": f"RLS-{owner.payment_id}"})
             await connection.execute(text("""
                 INSERT INTO ledger_entries (id, landlord_id, unit_id, tenant_id, invoice_id,
-                                            payment_transaction_id, entry_type, amount,
+                                            payment_transaction_id, mpesa_receipt_number, entry_type, amount,
                                             payment_method, status, description)
                 VALUES (:id, :landlord_id, :unit_id, :tenant_id, :invoice_id, :payment_id,
-                        'CREDIT', 12000, 'MPESA_STK_PUSH', 'COMPLETED', 'RLS integration fixture')
+                        :receipt, 'CREDIT', 12000, 'MPESA_STK_PUSH', 'COMPLETED', 'RLS integration fixture')
             """), {"id": owner.ledger_id, "landlord_id": owner.landlord_id, "unit_id": owner.unit_id,
-                  "tenant_id": owner.tenant_id, "invoice_id": owner.invoice_id, "payment_id": owner.payment_id})
+                  "tenant_id": owner.tenant_id, "invoice_id": owner.invoice_id, "payment_id": owner.payment_id,
+                  "receipt": f"RLS-{owner.payment_id}"})
 
     try:
         yield {"a": a, "b": b, "engine": app_engine, "sessions": app_sessions,
@@ -214,6 +221,7 @@ async def test_authenticated_oidc_request_resolves_membership_and_enforces_rls(
 ):
     owner = rls_database["a"]
     other_owner = rls_database["b"]
+    foreign_unassigned = await _insert_unassigned_payment(rls_database, other_owner)
     issuer = "https://rls-test.invalid/"
     audience = "kodiledger-api"
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -271,11 +279,18 @@ async def test_authenticated_oidc_request_resolves_membership_and_enforces_rls(
                 headers={"Authorization": f"Bearer {token}"},
                 params={"landlord_id": str(other_owner.landlord_id)},
             )
+            foreign_resolution = await client.post(
+                f"/api/v1/unassigned-payments/{foreign_unassigned['id']}/resolve",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"landlord_id": str(other_owner.landlord_id)},
+                json={"tenant_id": str(other_owner.tenant_id)},
+            )
     finally:
         if previous_override is None:
             api_app.dependency_overrides.pop(get_db, None)
         else:
             api_app.dependency_overrides[get_db] = previous_override
+        await _delete_unassigned_fixture(rls_database, foreign_unassigned)
 
     assert response.status_code == 200
     body = response.json()
@@ -289,6 +304,9 @@ async def test_authenticated_oidc_request_resolves_membership_and_enforces_rls(
     assert [row["id"] for row in properties_response.json()] == [
         str(owner.property_id)
     ]
+    # The JWT says ADMIN and names the other landlord, but active membership
+    # remains authoritative for the allocation command as well.
+    assert foreign_resolution.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -888,8 +906,12 @@ async def test_system_session_remains_separate_and_bypasses_rls(rls_database):
             row = (await connection.execute(text("""
                 SELECT current_user,
                        (SELECT rolbypassrls FROM pg_roles WHERE rolname = current_user),
-                       (SELECT count(*) FROM invoices)
-            """))).one()
+                       (SELECT count(*) FROM invoices
+                        WHERE landlord_id IN (:landlord_a, :landlord_b))
+            """), {
+                "landlord_a": rls_database["a"].landlord_id,
+                "landlord_b": rls_database["b"].landlord_id,
+            })).one()
         assert row[0] == "kodiflow_system"
         assert row[1] is True
         assert row[2] == 2
@@ -1032,10 +1054,37 @@ def _restore_resolution_client(previous_db, previous_principal) -> None:
         api_app.dependency_overrides[get_current_principal] = previous_principal
 
 
+async def _assert_resolution_has_no_effects(rls_database, owner: Owner, fixture: dict[str, object], *, expected_payment_status: str = "COMPLETED") -> None:
+    async with rls_database["admin_engine"].connect() as connection:
+        payment = (await connection.execute(text(
+            "SELECT tenant_id, status FROM payment_transactions WHERE id = :id"
+        ), {"id": fixture["payment_id"]})).one()
+        assert payment[0] is None
+        assert payment[1] == expected_payment_status
+        assert await connection.scalar(text(
+            "SELECT is_paid FROM invoices WHERE id = :id"
+        ), {"id": owner.invoice_id}) is False
+        assert await connection.scalar(text(
+            "SELECT is_resolved FROM unassigned_payments WHERE id = :id"
+        ), {"id": fixture["id"]}) is False
+        assert await connection.scalar(text(
+            "SELECT status FROM payment_processing WHERE id = :id"
+        ), {"id": fixture["processing_id"]}) == "UNASSIGNED"
+        for table in ("payment_allocations", "payment_credits", "ledger_entries"):
+            assert await connection.scalar(text(
+                f"SELECT count(*) FROM {table} WHERE payment_transaction_id = :id"
+            ), {"id": fixture["payment_id"]}) == 0
+        assert await connection.scalar(text(
+            "SELECT count(*) FROM outbox_events WHERE aggregate_id = :id"
+        ), {"id": fixture["payment_id"]}) == 0
+
+
 @pytest.mark.asyncio
 async def test_unassigned_payment_resolution_records_all_financial_effects_and_is_idempotent(rls_database):
     owner = rls_database["a"]
+    other_owner = rls_database["b"]
     fixture = await _insert_unassigned_payment(rls_database, owner)
+    foreign_fixture = await _insert_unassigned_payment(rls_database, other_owner)
     previous = await _resolution_client(rls_database, owner.principal)
     try:
         async with AsyncClient(
@@ -1062,7 +1111,16 @@ async def test_unassigned_payment_resolution_records_all_financial_effects_and_i
         _restore_resolution_client(*previous)
 
     assert listing.status_code == 200
-    assert any(row["id"] == str(fixture["id"]) for row in listing.json())
+    assert [row["id"] for row in listing.json()] == [str(fixture["id"])]
+    assert set(listing.json()[0]) == {
+        "id",
+        "mpesa_receipt_number",
+        "amount",
+        "payer_phone",
+        "payer_name",
+        "invalid_account_reference",
+        "created_at",
+    }
     assert response.status_code == 200
     body = response.json()
     assert body["payment_transaction_id"] == str(fixture["payment_id"])
@@ -1103,6 +1161,212 @@ async def test_unassigned_payment_resolution_records_all_financial_effects_and_i
         ), {"id": fixture["payment_id"]}) == 1
 
     await _delete_unassigned_fixture(rls_database, fixture)
+    await _delete_unassigned_fixture(rls_database, foreign_fixture)
+
+
+@pytest.mark.asyncio
+async def test_two_landlord_users_concurrently_resolve_one_payment_once(rls_database):
+    owner = rls_database["a"]
+    fixture = await _insert_unassigned_payment(rls_database, owner)
+    second_user_id, second_membership_id = uuid4(), uuid4()
+    second_principal = Principal(
+        user_id=str(second_user_id),
+        role=Role.LANDLORD,
+        landlord_id=str(owner.landlord_id),
+    )
+    async with rls_database["admin_engine"].begin() as connection:
+        await connection.execute(text("""
+            INSERT INTO app_users (id, identity_issuer, identity_subject)
+            VALUES (:id, 'https://rls-test.invalid/', :subject)
+        """), {"id": second_user_id, "subject": f"second-owner-{second_user_id}"})
+        await connection.execute(text("""
+            INSERT INTO user_memberships (id, user_id, role, landlord_id)
+            VALUES (:membership_id, :user_id, 'LANDLORD', :landlord_id)
+        """), {
+            "membership_id": second_membership_id,
+            "user_id": second_user_id,
+            "landlord_id": owner.landlord_id,
+        })
+
+    active_principal: ContextVar[Principal] = ContextVar(
+        "active_resolution_principal", default=owner.principal
+    )
+
+    async def override_get_db():
+        async with rls_database["sessions"]() as session:
+            yield session
+
+    def override_principal() -> Principal:
+        return active_principal.get()
+
+    previous_db = api_app.dependency_overrides.get(get_db)
+    previous_principal = api_app.dependency_overrides.get(get_current_principal)
+    api_app.dependency_overrides[get_db] = override_get_db
+    api_app.dependency_overrides[get_current_principal] = override_principal
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=api_app),
+            base_url="http://test",
+        ) as client:
+            async def resolve_as(principal: Principal):
+                token = active_principal.set(principal)
+                try:
+                    return await client.post(
+                        f"/api/v1/unassigned-payments/{fixture['id']}/resolve",
+                        json={"tenant_id": str(owner.tenant_id)},
+                    )
+                finally:
+                    active_principal.reset(token)
+
+            responses = await asyncio.wait_for(
+                asyncio.gather(
+                    resolve_as(owner.principal),
+                    resolve_as(second_principal),
+                ),
+                timeout=20,
+            )
+    finally:
+        if previous_db is None:
+            api_app.dependency_overrides.pop(get_db, None)
+        else:
+            api_app.dependency_overrides[get_db] = previous_db
+        if previous_principal is None:
+            api_app.dependency_overrides.pop(get_current_principal, None)
+        else:
+            api_app.dependency_overrides[get_current_principal] = previous_principal
+
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    async with rls_database["admin_engine"].connect() as connection:
+        assert await connection.scalar(text(
+            "SELECT is_resolved FROM unassigned_payments WHERE id = :id"
+        ), {"id": fixture["id"]}) is True
+        assert await connection.scalar(text(
+            "SELECT COALESCE(sum(amount), 0) FROM payment_allocations WHERE payment_transaction_id = :id"
+        ), {"id": fixture["payment_id"]}) == 12000
+        assert await connection.scalar(text(
+            "SELECT COALESCE(sum(amount), 0) FROM payment_credits WHERE payment_transaction_id = :id"
+        ), {"id": fixture["payment_id"]}) == 3000
+        assert await connection.scalar(text(
+            "SELECT count(*) FROM ledger_entries WHERE payment_transaction_id = :id"
+        ), {"id": fixture["payment_id"]}) == 1
+        assert await connection.scalar(text(
+            "SELECT count(*) FROM outbox_events WHERE aggregate_id = :id"
+        ), {"id": fixture["payment_id"]}) == 1
+
+    async with rls_database["admin_engine"].begin() as connection:
+        await connection.execute(text(
+            "DELETE FROM user_memberships WHERE id = :id"
+        ), {"id": second_membership_id})
+        await connection.execute(text("DELETE FROM app_users WHERE id = :id"), {
+            "id": second_user_id,
+        })
+    await _delete_unassigned_fixture(rls_database, fixture)
+
+
+@pytest.mark.asyncio
+async def test_resolution_racing_normal_allocator_preserves_one_financial_chain(rls_database):
+    owner = rls_database["a"]
+    fixture = await _insert_unassigned_payment(rls_database, owner)
+    previous = await _resolution_client(rls_database, owner.principal)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=api_app),
+            base_url="http://test",
+        ) as client:
+            async def resolve():
+                return await client.post(
+                    f"/api/v1/unassigned-payments/{fixture['id']}/resolve",
+                    json={"tenant_id": str(owner.tenant_id)},
+                )
+
+            async def allocate_normally():
+                async with rls_database["sessions"]() as session:
+                    try:
+                        async with session.begin():
+                            await set_rls_context(session, owner.principal)
+                            return await UnassignedPaymentResolutionService(
+                                session
+                            ).allocation.allocate_payment(
+                                payment_transaction_id=str(fixture["payment_id"]),
+                                tenant_id=str(owner.tenant_id),
+                                payment_amount=Decimal("15000"),
+                            )
+                    except AllocationConflict:
+                        return {"status": "CONFLICT"}
+
+            response, allocation_result = await asyncio.wait_for(
+                asyncio.gather(resolve(), allocate_normally()),
+                timeout=20,
+            )
+    finally:
+        _restore_resolution_client(*previous)
+
+    assert response.status_code == 200
+    assert allocation_result == {"status": "CONFLICT"} or (
+        allocation_result["status"] == "UNALLOCATED"
+        and allocation_result["reason"] == "PAYMENT_ALREADY_CONSUMED"
+    )
+    async with rls_database["admin_engine"].connect() as connection:
+        assert await connection.scalar(text(
+            "SELECT COALESCE(sum(amount), 0) FROM payment_allocations WHERE payment_transaction_id = :id"
+        ), {"id": fixture["payment_id"]}) == 12000
+        assert await connection.scalar(text(
+            "SELECT COALESCE(sum(amount), 0) FROM payment_credits WHERE payment_transaction_id = :id"
+        ), {"id": fixture["payment_id"]}) == 3000
+        assert await connection.scalar(text(
+            "SELECT count(*) FROM ledger_entries WHERE payment_transaction_id = :id"
+        ), {"id": fixture["payment_id"]}) == 1
+        assert await connection.scalar(text(
+            "SELECT count(*) FROM outbox_events WHERE aggregate_id = :id"
+        ), {"id": fixture["payment_id"]}) == 1
+    await _delete_unassigned_fixture(rls_database, fixture)
+
+
+@pytest.mark.asyncio
+async def test_different_payments_resolving_same_invoice_do_not_overallocate(rls_database):
+    owner = rls_database["a"]
+    first = await _insert_unassigned_payment(rls_database, owner)
+    second = await _insert_unassigned_payment(rls_database, owner)
+    previous = await _resolution_client(rls_database, owner.principal)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=api_app),
+            base_url="http://test",
+        ) as client:
+            responses = await asyncio.wait_for(
+                asyncio.gather(*(
+                    client.post(
+                        f"/api/v1/unassigned-payments/{fixture['id']}/resolve",
+                        json={"tenant_id": str(owner.tenant_id)},
+                    )
+                    for fixture in (first, second)
+                )),
+                timeout=20,
+            )
+    finally:
+        _restore_resolution_client(*previous)
+
+    assert [response.status_code for response in responses] == [200, 200]
+    async with rls_database["admin_engine"].connect() as connection:
+        assert await connection.scalar(text(
+            "SELECT COALESCE(sum(pa.amount), 0) FROM payment_allocations pa JOIN invoices i ON i.id = pa.invoice_id WHERE i.id = :id"
+        ), {"id": owner.invoice_id}) == 12000
+        assert await connection.scalar(text(
+            "SELECT is_paid FROM invoices WHERE id = :id"
+        ), {"id": owner.invoice_id}) is True
+        for fixture in (first, second):
+            assert await connection.scalar(text(
+                "SELECT is_resolved FROM unassigned_payments WHERE id = :id"
+            ), {"id": fixture["id"]}) is True
+            assert await connection.scalar(text(
+                "SELECT count(*) FROM ledger_entries WHERE payment_transaction_id = :id"
+            ), {"id": fixture["payment_id"]}) == 1
+            assert await connection.scalar(text(
+                "SELECT count(*) FROM outbox_events WHERE aggregate_id = :id"
+            ), {"id": fixture["payment_id"]}) == 1
+
+    await _delete_unassigned_fixture(rls_database, first)
+    await _delete_unassigned_fixture(rls_database, second)
 
 
 @pytest.mark.asyncio
@@ -1151,6 +1415,182 @@ async def test_unassigned_resolution_rejects_foreign_and_inactive_tenants(rls_da
 
     assert foreign.status_code == 404
     assert inactive.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_resolution_rejects_foreign_payment_and_forged_financial_fields(rls_database):
+    owner, other = rls_database["a"], rls_database["b"]
+    own_fixture = await _insert_unassigned_payment(rls_database, owner)
+    foreign_fixture = await _insert_unassigned_payment(rls_database, other)
+    previous = await _resolution_client(rls_database, owner.principal)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=api_app),
+            base_url="http://test",
+        ) as client:
+            foreign_payment = await client.post(
+                f"/api/v1/unassigned-payments/{foreign_fixture['id']}/resolve",
+                json={"tenant_id": str(other.tenant_id)},
+            )
+            forged_fields = await client.post(
+                f"/api/v1/unassigned-payments/{own_fixture['id']}/resolve",
+                json={
+                    "tenant_id": str(owner.tenant_id),
+                    "landlord_id": str(other.landlord_id),
+                    "invoice_id": str(other.invoice_id),
+                    "amount": "1.00",
+                    "payment_status": "COMPLETED",
+                    "allocation_status": "ALLOCATED",
+                    "role": "ADMIN",
+                    "ledger_amount": "1.00",
+                    "outbox_event_id": str(uuid4()),
+                },
+            )
+    finally:
+        _restore_resolution_client(*previous)
+
+    assert foreign_payment.status_code == 404
+    assert forged_fields.status_code == 422
+    await _assert_resolution_has_no_effects(rls_database, owner, own_fixture)
+    await _assert_resolution_has_no_effects(rls_database, other, foreign_fixture)
+    await _delete_unassigned_fixture(rls_database, own_fixture)
+    await _delete_unassigned_fixture(rls_database, foreign_fixture)
+
+
+@pytest.mark.asyncio
+async def test_resolution_rejects_noncompleted_payment_without_financial_effects(rls_database):
+    owner = rls_database["a"]
+    fixture = await _insert_unassigned_payment(rls_database, owner)
+    async with rls_database["admin_engine"].begin() as connection:
+        await connection.execute(text(
+            "UPDATE payment_transactions SET status = 'FAILED' WHERE id = :id"
+        ), {"id": fixture["payment_id"]})
+
+    previous = await _resolution_client(rls_database, owner.principal)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=api_app),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                f"/api/v1/unassigned-payments/{fixture['id']}/resolve",
+                json={"tenant_id": str(owner.tenant_id)},
+            )
+    finally:
+        _restore_resolution_client(*previous)
+
+    assert response.status_code == 409
+    await _assert_resolution_has_no_effects(
+        rls_database, owner, fixture, expected_payment_status="FAILED"
+    )
+    await _delete_unassigned_fixture(rls_database, fixture)
+
+
+@pytest.mark.asyncio
+async def test_resolution_without_unpaid_invoice_records_full_amount_as_credit(rls_database):
+    owner = rls_database["a"]
+    fixture = await _insert_unassigned_payment(rls_database, owner)
+    async with rls_database["admin_engine"].begin() as connection:
+        await connection.execute(text(
+            "UPDATE invoices SET is_paid = TRUE WHERE id = :id"
+        ), {"id": owner.invoice_id})
+
+    previous = await _resolution_client(rls_database, owner.principal)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=api_app),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                f"/api/v1/unassigned-payments/{fixture['id']}/resolve",
+                json={"tenant_id": str(owner.tenant_id)},
+            )
+            ledger_read = await client.get(
+                "/api/v1/ledger",
+                params={"payment_transaction_id": str(fixture["payment_id"])},
+            )
+    finally:
+        _restore_resolution_client(*previous)
+
+    assert response.status_code == 200
+    assert response.json()["allocation"]["status"] == "UNALLOCATED"
+    assert response.json()["allocation"]["reason"] == "NO_UNPAID_INVOICE"
+    assert response.json()["allocation"]["credited_amount"] == "15000.00"
+    assert ledger_read.status_code == 200
+    assert ledger_read.json()["total"] == 1
+    assert ledger_read.json()["items"][0]["payment_transaction_id"] == str(fixture["payment_id"])
+    assert ledger_read.json()["items"][0]["amount"] == "15000.00"
+    async with rls_database["admin_engine"].connect() as connection:
+        assert await connection.scalar(text(
+            "SELECT is_paid FROM invoices WHERE id = :id"
+        ), {"id": owner.invoice_id}) is True
+        assert await connection.scalar(text(
+            "SELECT count(*) FROM payment_allocations WHERE payment_transaction_id = :id"
+        ), {"id": fixture["payment_id"]}) == 0
+        assert await connection.scalar(text(
+            "SELECT count(*) FROM payment_credits WHERE payment_transaction_id = :id"
+        ), {"id": fixture["payment_id"]}) == 1
+        assert await connection.scalar(text(
+            "SELECT amount FROM payment_credits WHERE payment_transaction_id = :id"
+        ), {"id": fixture["payment_id"]}) == 15000
+        assert await connection.scalar(text(
+            "SELECT tenant_id FROM payment_credits WHERE payment_transaction_id = :id"
+        ), {"id": fixture["payment_id"]}) == owner.tenant_id
+        assert await connection.scalar(text(
+            "SELECT count(*) FROM ledger_entries WHERE payment_transaction_id = :id"
+        ), {"id": fixture["payment_id"]}) == 1
+        assert await connection.scalar(text(
+            "SELECT count(*) FROM outbox_events WHERE aggregate_id = :id"
+        ), {"id": fixture["payment_id"]}) == 1
+        assert await connection.scalar(text(
+            "SELECT is_resolved FROM unassigned_payments WHERE id = :id"
+        ), {"id": fixture["id"]}) is True
+    await _delete_unassigned_fixture(rls_database, fixture)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_point", ["ledger", "outbox"])
+async def test_resolution_rolls_back_all_financial_effects_after_write_failure(
+    rls_database,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+):
+    owner = rls_database["a"]
+    fixture = await _insert_unassigned_payment(rls_database, owner)
+
+    if failure_point == "ledger":
+        original = LedgerRepository.create_credit
+
+        async def fail_after_ledger_insert(self, *args, **kwargs):
+            await original(self, *args, **kwargs)
+            raise RuntimeError("injected ledger failure after insert")
+
+        monkeypatch.setattr(LedgerRepository, "create_credit", fail_after_ledger_insert)
+    else:
+        original = OutboxEventRepository.create
+
+        async def fail_after_outbox_insert(self, *args, **kwargs):
+            await original(self, *args, **kwargs)
+            raise RuntimeError("injected outbox failure after insert")
+
+        monkeypatch.setattr(OutboxEventRepository, "create", fail_after_outbox_insert)
+
+    previous = await _resolution_client(rls_database, owner.principal)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=api_app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                f"/api/v1/unassigned-payments/{fixture['id']}/resolve",
+                json={"tenant_id": str(owner.tenant_id)},
+            )
+    finally:
+        _restore_resolution_client(*previous)
+
+    assert response.status_code == 500
+    await _assert_resolution_has_no_effects(rls_database, owner, fixture)
+    await _delete_unassigned_fixture(rls_database, fixture)
 
 
 @pytest.mark.asyncio
@@ -1313,9 +1753,90 @@ async def test_ledger_read_api_lists_and_reads_only_authenticated_landlord_rows(
         _restore_resolution_client(*previous)
 
     assert listing.status_code == 200
-    assert [row["id"] for row in listing.json()] == [str(owner.ledger_id)]
+    assert listing.json()["total"] == 1
+    assert [row["id"] for row in listing.json()["items"]] == [str(owner.ledger_id)]
     assert own_entry.status_code == 200
     assert own_entry.json()["payment_transaction_id"] == str(owner.payment_id)
     assert own_entry.json()["amount"] == "12000.00"
     assert "payer_phone" not in own_entry.json()
     assert foreign_entry.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_ledger_filters_pagination_and_scope_are_deterministic(rls_database):
+    owner, other = rls_database["a"], rls_database["b"]
+    entry_ids = sorted([uuid4(), uuid4()])
+    fixed_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    async with rls_database["admin_engine"].begin() as connection:
+        for index, entry_id in enumerate(entry_ids):
+            await connection.execute(text("""
+                INSERT INTO ledger_entries (
+                    id, landlord_id, unit_id, tenant_id, invoice_id,
+                    payment_transaction_id, mpesa_receipt_number,
+                    entry_type, amount, payment_method, status, description, created_at
+                ) VALUES (
+                    :id, :landlord_id, :unit_id, :tenant_id, :invoice_id,
+                    :payment_id, :receipt, 'CREDIT', :amount,
+                    'MPESA_STK_PUSH', 'COMPLETED', 'Ledger pagination fixture', :created_at
+                )
+            """), {
+                "id": entry_id,
+                "landlord_id": owner.landlord_id,
+                "unit_id": owner.unit_id,
+                "tenant_id": owner.tenant_id,
+                "invoice_id": owner.invoice_id,
+                "payment_id": owner.payment_id,
+                "receipt": f"PAGE-{entry_id}",
+                "amount": 100 + index,
+                "created_at": fixed_time,
+            })
+
+    previous = await _resolution_client(rls_database, owner.principal)
+    try:
+        async with AsyncClient(transport=ASGITransport(app=api_app), base_url="http://test") as client:
+            first = await client.get("/api/v1/ledger", params={
+                "created_from": fixed_time.isoformat(),
+                "created_to": fixed_time.isoformat(),
+                "limit": 1,
+                "offset": 0,
+            })
+            second = await client.get("/api/v1/ledger", params={
+                "created_from": fixed_time.isoformat(),
+                "created_to": fixed_time.isoformat(),
+                "limit": 1,
+                "offset": 1,
+            })
+            invoice_filter = await client.get("/api/v1/ledger", params={"invoice_id": str(owner.invoice_id)})
+            property_filter = await client.get(
+                "/api/v1/ledger", params={"property_id": str(owner.property_id)}
+            )
+            receipt_filter = await client.get("/api/v1/ledger", params={"receipt": f"RLS-{owner.payment_id}"})
+            empty = await client.get("/api/v1/ledger", params={"tenant_id": str(other.tenant_id)})
+            forged_scope = await client.get("/api/v1/ledger", params={
+                "landlord_id": str(other.landlord_id),
+            })
+            foreign_property_filter = await client.get(
+                "/api/v1/ledger", params={"property_id": str(other.property_id)}
+            )
+            invalid_range = await client.get("/api/v1/ledger", params={
+                "created_from": "2026-02-01T00:00:00Z",
+                "created_to": "2026-01-01T00:00:00Z",
+            })
+            naive_date = await client.get("/api/v1/ledger", params={"created_from": "2026-01-01T00:00:00"})
+    finally:
+        _restore_resolution_client(*previous)
+
+    assert first.status_code == second.status_code == 200
+    assert first.json()["total"] == second.json()["total"] == 2
+    assert first.json()["items"][0]["id"] == str(entry_ids[1])
+    assert second.json()["items"][0]["id"] == str(entry_ids[0])
+    assert invoice_filter.json()["total"] == 3
+    assert property_filter.json()["total"] == 3
+    assert receipt_filter.json()["total"] == 1
+    assert empty.json()["items"] == [] and empty.json()["total"] == 0
+    assert forged_scope.status_code == 200
+    assert all(row["id"] != str(other.ledger_id) for row in forged_scope.json()["items"])
+    assert foreign_property_filter.status_code == 200
+    assert foreign_property_filter.json()["items"] == []
+    assert invalid_range.status_code == 422
+    assert naive_date.status_code == 422

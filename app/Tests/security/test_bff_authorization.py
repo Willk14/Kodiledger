@@ -279,6 +279,83 @@ def test_payment_openapi_matches_documented_read_contract():
     assert "post" not in collection and "patch" not in detail and "delete" not in detail
 
 
+def test_allocation_and_resolution_openapi_matches_documented_contract():
+    paths = app.openapi()["paths"]
+    allocation_reads = paths["/api/v1/payments/{payment_id}/allocations"]
+    credit_reads = paths["/api/v1/payments/{payment_id}/credits"]
+    unresolved = paths["/api/v1/unassigned-payments"]
+    resolve = paths["/api/v1/unassigned-payments/{payment_id}/resolve"]["post"]
+    schemas = app.openapi()["components"]["schemas"]
+
+    assert set(allocation_reads) == {"get"}
+    assert set(credit_reads) == {"get"}
+    assert set(unresolved) == {"get"}
+    assert "/api/v1/allocations" not in paths
+    assert "/api/v1/allocations/{allocation_id}" not in paths
+
+    allocation_read = allocation_reads["get"]
+    credit_read = credit_reads["get"]
+    list_unresolved = unresolved["get"]
+    for operation in (allocation_read, credit_read, list_unresolved, resolve):
+        assert operation["security"] == [{"HTTPBearer": []}]
+
+    assert allocation_read["responses"]["200"]["content"]["application/json"]["schema"]["type"] == "array"
+    assert allocation_read["responses"]["200"]["content"]["application/json"]["schema"]["items"]["$ref"] == "#/components/schemas/PaymentAllocationRead"
+    assert credit_read["responses"]["200"]["content"]["application/json"]["schema"]["items"]["$ref"] == "#/components/schemas/PaymentCreditRead"
+    assert list_unresolved["responses"]["200"]["content"]["application/json"]["schema"]["items"]["$ref"] == "#/components/schemas/UnassignedPaymentRead"
+    assert resolve["requestBody"]["content"]["application/json"]["schema"]["$ref"] == "#/components/schemas/UnassignedPaymentResolve"
+    assert resolve["responses"]["200"]["content"]["application/json"]["schema"]["$ref"] == "#/components/schemas/UnassignedPaymentResolutionRead"
+    assert set(schemas["UnassignedPaymentResolve"]["properties"]) == {"tenant_id"}
+    assert schemas["UnassignedPaymentResolve"]["additionalProperties"] is False
+    assert set(schemas["UnassignedPaymentRead"]["properties"]) == {
+        "id",
+        "mpesa_receipt_number",
+        "amount",
+        "payer_phone",
+        "payer_name",
+        "invalid_account_reference",
+        "created_at",
+    }
+    assert set(schemas["UnassignedPaymentResolutionRead"]["properties"]) == {
+        "id",
+        "payment_transaction_id",
+        "mpesa_receipt_number",
+        "tenant_id",
+        "unit_id",
+        "amount",
+        "allocation",
+        "outbox_event_id",
+        "resolved_at",
+    }
+
+    assert {"401", "403", "404", "422", "500", "503"}.issubset(allocation_read["responses"])
+    assert {"401", "403", "404", "422", "500", "503"}.issubset(credit_read["responses"])
+    assert {"401", "403", "500", "503"}.issubset(list_unresolved["responses"])
+    assert {"401", "403", "404", "409", "422", "500", "503"}.issubset(resolve["responses"])
+
+
+@pytest.mark.parametrize("role", ["TENANT", "CARETAKER", "ADMIN"])
+def test_unassigned_payment_resolution_requires_landlord_role(role: str):
+    path = "/api/v1/unassigned-payments/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/resolve"
+    unauthenticated = client.post(path, json={"tenant_id": TENANT_SCOPE})
+    unauthenticated_list = client.get("/api/v1/unassigned-payments")
+    token = make_token(user_id=f"{role.lower()}-user", role=role)
+    forbidden = client.post(
+        path,
+        json={"tenant_id": TENANT_SCOPE},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    forbidden_list = client.get(
+        "/api/v1/unassigned-payments",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert unauthenticated.status_code == 401
+    assert unauthenticated_list.status_code == 401
+    assert forbidden.status_code == 403
+    assert forbidden_list.status_code == 403
+
+
 # ============================================================
 # Landlord Authorization
 # ============================================================
@@ -460,3 +537,77 @@ def test_malformed_authorization_header_is_rejected():
     )
 
     assert response.status_code == 401
+
+
+def test_ledger_api_is_read_only_and_openapi_is_complete():
+    paths = app.openapi()["paths"]
+    collection = paths["/api/v1/ledger"]
+    detail = paths["/api/v1/ledger/{entry_id}"]
+    schemas = app.openapi()["components"]["schemas"]
+
+    assert set(collection) == {"get"}
+    assert set(detail) == {"get"}
+    list_operation = collection["get"]
+    detail_operation = detail["get"]
+    assert list_operation["security"] == [{"HTTPBearer": []}]
+    assert detail_operation["security"] == [{"HTTPBearer": []}]
+    assert list_operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"] == "#/components/schemas/LedgerEntryPage"
+    assert detail_operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"] == "#/components/schemas/LedgerEntryRead"
+    assert {"401", "403", "422", "500"}.issubset(list_operation["responses"])
+    assert {"401", "403", "404", "422", "500"}.issubset(detail_operation["responses"])
+    assert {parameter["name"] for parameter in list_operation["parameters"]} == {
+        "limit", "offset", "payment_transaction_id", "tenant_id", "invoice_id",
+        "unit_id", "property_id", "receipt", "created_from", "created_to",
+    }
+    assert list_operation["parameters"][0]["schema"]["maximum"] == 100
+    assert schemas["LedgerEntryPage"]["properties"]["items"]["items"]["$ref"] == "#/components/schemas/LedgerEntryRead"
+
+
+def test_registered_api_surface_matches_frozen_openapi_contract():
+    expected = {
+        "/api/v1/webhooks/mpesa": {"post"},
+        "/api/v1/payments": {"get"},
+        "/api/v1/payments/{payment_id}": {"get"},
+        "/api/v1/payments/{payment_id}/allocations": {"get"},
+        "/api/v1/payments/{payment_id}/credits": {"get"},
+        "/api/v1/payments/stk-push": {"post"},
+        "/api/v1/payments/stk-push/unresolved": {"get"},
+        "/api/v1/payments/stk-push/{checkout_request_id}/query": {"post"},
+        "/api/v1/properties": {"get"},
+        "/api/v1/properties/{property_id}": {"get"},
+        "/api/v1/properties/{property_id}/units": {"get", "post"},
+        "/api/v1/units/{unit_id}": {"get", "patch"},
+        "/api/v1/tenants": {"get", "post"},
+        "/api/v1/tenants/me": {"get"},
+        "/api/v1/tenants/{tenant_id}": {"get"},
+        "/api/v1/invoices": {"get", "post"},
+        "/api/v1/invoices/{invoice_id}": {"get"},
+        "/api/v1/unassigned-payments": {"get"},
+        "/api/v1/unassigned-payments/{payment_id}/resolve": {"post"},
+        "/api/v1/ledger": {"get"},
+        "/api/v1/ledger/{entry_id}": {"get"},
+        "/api/v1/bff/landlord/me": {"get"},
+        "/api/v1/bff/caretaker/me": {"get"},
+    }
+    openapi_paths = app.openapi()["paths"]
+    actual = {
+        path: {method for method in operations if method in {"get", "post", "put", "patch", "delete"}}
+        for path, operations in openapi_paths.items()
+        if path.startswith("/api/v1/")
+    }
+
+    assert actual == expected
+    assert "/api/v1/allocations" not in openapi_paths
+
+
+@pytest.mark.parametrize("role", ["TENANT", "CARETAKER", "ADMIN"])
+def test_ledger_api_requires_landlord_read_authority(role: str):
+    unauthenticated = client.get("/api/v1/ledger")
+    token = make_token(user_id=f"{role.lower()}-ledger-user", role=role)
+    forbidden = client.get(
+        "/api/v1/ledger",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert unauthenticated.status_code == 401
+    assert forbidden.status_code == 403

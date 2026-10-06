@@ -39,9 +39,10 @@ class UnassignedPaymentResolutionService:
         self.ledger = LedgerRepository(db)
         self.outbox = OutboxEventService(OutboxEventRepository(db))
         self.allocation = InvoiceAllocationService(
-            InvoiceRepository(db),
-            PaymentAllocationRepository(db),
-            PaymentCreditRepository(db),
+            invoice_repository=InvoiceRepository(db),
+            payment_allocation_repository=PaymentAllocationRepository(db),
+            payment_credit_repository=PaymentCreditRepository(db),
+            payment_transaction_repository=self.transactions,
         )
 
     async def list_unresolved(self, *, landlord_id: UUID) -> list[dict[str, Any]]:

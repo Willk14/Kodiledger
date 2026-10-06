@@ -1,6 +1,8 @@
 from decimal import Decimal
 
-from sqlalchemy import select
+from datetime import datetime
+
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,48 +15,70 @@ class LedgerRepository:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
 
-    async def list_by_landlord(self, landlord_id: str) -> list:
-        from app.models.ledger_entry import LedgerEntry
-
-        result = await self.db.execute(
-            select(LedgerEntry)
-            .where(LedgerEntry.landlord_id == landlord_id)
-            .order_by(LedgerEntry.created_at.desc(), LedgerEntry.id.desc())
-        )
-        return list(result.scalars().all())
-
-    async def get_by_id_and_landlord(
+    async def list_by_landlord(
         self,
-        *,
-        entry_id: str,
         landlord_id: str,
-    ):
+        *,
+        payment_transaction_id: str | None = None,
+        tenant_id: str | None = None,
+        invoice_id: str | None = None,
+        unit_id: str | None = None,
+        property_id: str | None = None,
+        receipt: str | None = None,
+        created_from: datetime | None = None,
+        created_to: datetime | None = None,
+        limit: int,
+        offset: int,
+    ) -> tuple[list, int]:
         from app.models.ledger_entry import LedgerEntry
 
-        result = await self.db.execute(
-            select(LedgerEntry).where(
-                LedgerEntry.id == entry_id,
-                LedgerEntry.landlord_id == landlord_id,
+        filters = [LedgerEntry.landlord_id == landlord_id]
+        if payment_transaction_id is not None:
+            filters.append(
+                LedgerEntry.payment_transaction_id == payment_transaction_id
             )
+        if tenant_id is not None:
+            filters.append(LedgerEntry.tenant_id == tenant_id)
+        if invoice_id is not None:
+            filters.append(LedgerEntry.invoice_id == invoice_id)
+        if unit_id is not None:
+            filters.append(LedgerEntry.unit_id == unit_id)
+        if property_id is not None:
+            from app.models.unit import Unit
+
+            filters.append(
+                select(Unit.id)
+                .where(
+                    Unit.id == LedgerEntry.unit_id,
+                    Unit.property_id == property_id,
+                )
+                .exists()
+            )
+        if receipt is not None:
+            filters.append(LedgerEntry.mpesa_receipt_number == receipt)
+        if created_from is not None:
+            filters.append(LedgerEntry.created_at >= created_from)
+        if created_to is not None:
+            filters.append(LedgerEntry.created_at <= created_to)
+
+        count_result = await self.db.execute(
+            select(func.count(LedgerEntry.id)).where(*filters)
         )
-        return result.scalar_one_or_none()
-
-    async def list_by_landlord(self, landlord_id: str) -> list:
-        from app.models.ledger_entry import LedgerEntry
-
         result = await self.db.execute(
             select(LedgerEntry)
-            .where(LedgerEntry.landlord_id == landlord_id)
+            .where(*filters)
             .order_by(LedgerEntry.created_at.desc(), LedgerEntry.id.desc())
+            .limit(limit)
+            .offset(offset)
         )
-        return list(result.scalars().all())
+        return list(result.scalars().all()), int(count_result.scalar_one())
 
     async def get_by_id_and_landlord(
         self,
         *,
         entry_id: str,
         landlord_id: str,
-    ):
+    ) -> object | None:
         from app.models.ledger_entry import LedgerEntry
 
         result = await self.db.execute(

@@ -63,6 +63,20 @@ class PaymentTransactionRepository:
         )
         return result.scalar_one_or_none()
 
+    async def get_by_id_for_update(
+        self,
+        *,
+        payment_transaction_id: str,
+    ) -> PaymentTransaction | None:
+        """Load and lock a payment row before changing its financial use."""
+        result = await self.db.execute(
+            select(PaymentTransaction)
+            .where(PaymentTransaction.id == payment_transaction_id)
+            .with_for_update()
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
     async def get_by_id_for_tenant(
         self,
         *,

@@ -22,3 +22,10 @@ class LedgerEntryRead(BaseModel):
     status: str
     description: str
     created_at: datetime | None
+
+
+class LedgerEntryPage(BaseModel):
+    items: list[LedgerEntryRead]
+    total: int
+    limit: int
+    offset: int

@@ -23,4 +23,3 @@ pytest==8.3.2
 pytest-asyncio==0.23.8
 
 aiokafka==0.14.0
-aiokafka==0.14.0

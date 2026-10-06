@@ -27,7 +27,16 @@ BEGIN
 END
 $$;
 
-GRANT CONNECT ON DATABASE kodiflow_db TO kodiflow_system;
+-- Use the database selected by the migration connection. Hosted PostgreSQL
+-- providers (including Supabase) commonly name the project database `postgres`.
+DO $$
+BEGIN
+    EXECUTE format(
+        'GRANT CONNECT ON DATABASE %I TO kodiflow_system',
+        current_database()
+    );
+END
+$$;
 GRANT USAGE ON SCHEMA public TO kodiflow_system;
 GRANT USAGE ON SCHEMA app TO kodiflow_system;
 

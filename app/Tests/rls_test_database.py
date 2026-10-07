@@ -191,6 +191,14 @@ async def _apply_migrations(connection: asyncpg.Connection) -> None:
             await connection.execute(
                 (MIGRATIONS / "0017_payment_credit_applications.sql").read_text(encoding="utf-8")
             )
+        identity_lookup_policy_exists = await connection.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM pg_policy WHERE polrelid = 'public.app_users'::regclass "
+            "AND polname = 'app_users_kodiflow_app_read')"
+        )
+        if not identity_lookup_policy_exists:
+            await connection.execute(
+                (MIGRATIONS / "0018_identity_lookup_rls.sql").read_text(encoding="utf-8")
+            )
         return
 
     for migration in sorted(MIGRATIONS.glob("*.sql")):

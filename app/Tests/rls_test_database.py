@@ -29,6 +29,7 @@ RLS_TABLES = (
     "payment_transactions",
     "payment_allocations",
     "payment_credits",
+    "payment_credit_applications",
     "unassigned_payments",
     "outbox_events",
     "utility_readings",

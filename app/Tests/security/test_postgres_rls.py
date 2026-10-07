@@ -172,6 +172,104 @@ async def test_postgres_rls_reads_only_authenticated_landlord_rows(rls_database)
 
 
 @pytest.mark.asyncio
+async def test_payment_credit_application_rls_scopes_reads_and_inserts(rls_database):
+    owner_a, owner_b = rls_database["a"], rls_database["b"]
+    credit_a_read, credit_a_insert = uuid4(), uuid4()
+    credit_b_read, credit_b_insert = uuid4(), uuid4()
+    application_a, application_b = uuid4(), uuid4()
+    application_allowed = uuid4()
+
+    async with rls_database["admin_engine"].begin() as connection:
+        await connection.execute(text("""
+            INSERT INTO payment_credits (id, payment_transaction_id, tenant_id, amount)
+            VALUES
+                (:credit_a_read, :payment_a, :tenant_a, 100),
+                (:credit_a_insert, :payment_a, :tenant_a, 100),
+                (:credit_b_read, :payment_b, :tenant_b, 100),
+                (:credit_b_insert, :payment_b, :tenant_b, 100)
+        """), {
+            "credit_a_read": credit_a_read,
+            "credit_a_insert": credit_a_insert,
+            "payment_a": owner_a.payment_id,
+            "tenant_a": owner_a.tenant_id,
+            "credit_b_read": credit_b_read,
+            "credit_b_insert": credit_b_insert,
+            "payment_b": owner_b.payment_id,
+            "tenant_b": owner_b.tenant_id,
+        })
+        await connection.execute(text("""
+            INSERT INTO payment_credit_applications
+                (id, payment_credit_id, invoice_id, amount, application_key)
+            VALUES
+                (:application_a, :credit_a, :invoice_a, 25, :key_a),
+                (:application_b, :credit_b, :invoice_b, 25, :key_b)
+        """), {
+            "application_a": application_a,
+            "credit_a": credit_a_read,
+            "invoice_a": owner_a.invoice_id,
+            "key_a": f"rls-read-a-{application_a}",
+            "application_b": application_b,
+            "credit_b": credit_b_read,
+            "invoice_b": owner_b.invoice_id,
+            "key_b": f"rls-read-b-{application_b}",
+        })
+
+    try:
+        sessions = rls_database["sessions"]
+        assert await _visible_ids(sessions, owner_a.principal, "payment_credit_applications") == {
+            application_a
+        }
+        assert await _visible_ids(sessions, owner_b.principal, "payment_credit_applications") == {
+            application_b
+        }
+
+        async with sessions() as session, session.begin():
+            await set_rls_context(session, owner_a.principal)
+            await session.execute(text("""
+                INSERT INTO payment_credit_applications
+                    (id, payment_credit_id, invoice_id, amount, application_key)
+                VALUES (:id, :credit_id, :invoice_id, 10, :key)
+            """), {
+                "id": application_allowed,
+                "credit_id": credit_a_insert,
+                "invoice_id": owner_a.invoice_id,
+                "key": f"rls-allowed-a-{application_allowed}",
+            })
+
+        with pytest.raises(DBAPIError):
+            async with sessions() as session, session.begin():
+                await set_rls_context(session, owner_a.principal)
+                await session.execute(text("""
+                    INSERT INTO payment_credit_applications
+                        (id, payment_credit_id, invoice_id, amount, application_key)
+                    VALUES (:id, :credit_id, :invoice_id, 10, :key)
+                """), {
+                    "id": uuid4(),
+                    "credit_id": credit_b_insert,
+                    "invoice_id": owner_b.invoice_id,
+                    "key": f"rls-denied-a-to-b-{uuid4()}",
+                })
+
+        assert await _visible_ids(sessions, owner_a.principal, "payment_credit_applications") == {
+            application_a,
+            application_allowed,
+        }
+        assert await _visible_ids(sessions, owner_b.principal, "payment_credit_applications") == {
+            application_b
+        }
+    finally:
+        async with rls_database["admin_engine"].begin() as connection:
+            await connection.execute(text("""
+                DELETE FROM payment_credit_applications
+                WHERE id = ANY(:ids)
+            """), {"ids": [application_a, application_b, application_allowed]})
+            await connection.execute(text("""
+                DELETE FROM payment_credits
+                WHERE id = ANY(:ids)
+            """), {"ids": [credit_a_read, credit_a_insert, credit_b_read, credit_b_insert]})
+
+
+@pytest.mark.asyncio
 async def test_postgres_rls_denies_cross_landlord_financial_mutations(rls_database):
     b = rls_database["b"]
     sessions = rls_database["sessions"]

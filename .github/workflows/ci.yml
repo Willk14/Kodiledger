@@ -71,8 +71,8 @@ jobs:
       - name: Start isolated PostgreSQL
         run: docker compose -f docker-compose.rls-test.yml --env-file .env.rls-test up -d --wait
 
-      - name: Start Kafka test broker
-        run: docker compose -f docker-compose.yml up -d kafka
+      - name: Start main PostgreSQL and Kafka test broker
+        run: docker compose -f docker-compose.yml up -d --wait postgres kafka
 
       - name: Wait for Kafka test broker
         shell: bash

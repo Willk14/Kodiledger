@@ -60,7 +60,7 @@ Unauthenticated STK initiation is a known security gap. Before exposing it to en
 
 Protected business routes that declare `get_rls_db` call `set_rls_context()` on the request-scoped database session. It sets `app.current_landlord_id`, `app.current_user_id`, and `app.current_role` transaction-locally from the resolved principal. Final RLS policies in migrations `0010` and `0011` primarily scope records by landlord; application services and repositories also apply resource-specific tenant and ownership filters. `app.current_role` is set by the helper but is not an authority input to the final policies.
 
-RLS is an additional enforcement layer, not a replacement for route authorization. Routes using the system database session bypass this user-scoped RLS path and must remain restricted to trusted callbacks, operators, and workers. Keep application and system database credentials separate.
+RLS is an additional enforcement layer, not a replacement for route authorization. Routes using the system database session use explicit system-role policies on the tables required by trusted callbacks and workers; they do not use a role-level `BYPASSRLS` attribute. Keep application and system database credentials separate, and restrict the system credential to trusted workflows.
 
 The schema/migration must be installed and provisioned consistently in each environment. The presence of policy SQL alone does not prove a deployed role is constrained correctly. See [DATABASE.md](DATABASE.md) and [SECURITY.md](SECURITY.md) for policy and role details.
 

@@ -355,7 +355,7 @@ kodiflow_app
 kodiflow_system
       │
       └── system/webhook/background operations
-          with required elevated RLS capability
+          with explicit system-only policies on reviewed tables
 
 The application database connection is intentionally separated from the system
 connection.
@@ -372,7 +372,7 @@ System webhook/background operation
         ↓
 System DB session
         ↓
-System-level database operations
+Explicit system-role RLS policies on the tables it needs
 
 This separation is important because a single unrestricted database role would
 weaken tenant isolation.

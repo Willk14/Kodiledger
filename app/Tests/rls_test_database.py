@@ -35,6 +35,7 @@ RLS_TABLES = (
     "utility_readings",
     "user_device_tokens",
 )
+SYSTEM_POLICY_TABLES = RLS_TABLES + ("app_users", "user_memberships")
 
 
 def _config() -> dict[str, str]:
@@ -199,6 +200,9 @@ async def _apply_migrations(connection: asyncpg.Connection) -> None:
             await connection.execute(
                 (MIGRATIONS / "0018_identity_lookup_rls.sql").read_text(encoding="utf-8")
             )
+        await connection.execute(
+            (MIGRATIONS / "0019_system_role_rls_policies.sql").read_text(encoding="utf-8")
+        )
         return
 
     for migration in sorted(MIGRATIONS.glob("*.sql")):
@@ -233,8 +237,8 @@ async def _verify_schema_and_roles(connection: asyncpg.Connection) -> None:
     app, system = by_name.get(EXPECTED_APP_ROLE), by_name.get(EXPECTED_SYSTEM_ROLE)
     if not app or app["rolsuper"] or app["rolbypassrls"] or not app["rolcanlogin"]:
         raise RuntimeError("kodiflow_app is missing or has unsafe elevated/RLS-bypass attributes.")
-    if not system or system["rolsuper"] or not system["rolbypassrls"] or not system["rolcanlogin"]:
-        raise RuntimeError("kodiflow_system is missing its separate expected BYPASSRLS role attributes.")
+    if not system or system["rolsuper"] or system["rolbypassrls"] or not system["rolcanlogin"]:
+        raise RuntimeError("kodiflow_system is missing its separate non-bypass login role attributes.")
 
     relations = await connection.fetch(
         "SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity, "
@@ -249,8 +253,30 @@ async def _verify_schema_and_roles(connection: asyncpg.Connection) -> None:
         raise RuntimeError(f"Migration chain did not create expected RLS tables: {', '.join(missing)}")
     for name in RLS_TABLES:
         row = by_table[name]
-        if not row["relrowsecurity"] or not row["relforcerowsecurity"] or not row["has_policy"]:
+        if (
+            not row["relrowsecurity"]
+            or not row["relforcerowsecurity"]
+            or not row["has_policy"]
+        ):
             raise RuntimeError(f"RLS/forced RLS policy verification failed for {name}.")
+
+    system_policy_relations = await connection.fetch(
+        "SELECT c.relname, c.relrowsecurity, EXISTS(SELECT 1 FROM pg_policy p "
+        "WHERE p.polrelid = c.oid AND p.polname = 'kodiflow_system_access') AS has_policy "
+        "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = 'public' AND c.relname = ANY($1::text[])",
+        list(SYSTEM_POLICY_TABLES),
+    )
+    missing_system_policies = sorted(
+        row["relname"]
+        for row in system_policy_relations
+        if not row["relrowsecurity"] or not row["has_policy"]
+    )
+    if missing_system_policies:
+        raise RuntimeError(
+            "Migration 0019 is missing system policies for: "
+            + ", ".join(missing_system_policies)
+        )
 
     identity_constraints = await connection.fetch(
         "SELECT conname FROM pg_constraint WHERE conrelid = 'public.user_memberships'::regclass"

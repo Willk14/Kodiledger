@@ -48,7 +48,7 @@ Some modules skip when their dedicated PostgreSQL test configuration is absent. 
 
 Webhook and RLS tests use a dedicated local test cluster and the `kodiflow_test` database. Keep it separate from development and production databases: test fixtures insert and delete rows, and the initializer applies migrations and configures test roles.
 
-1. Configure the `RLS_TEST_*` values from `.env.example` in the ignored local `.env.rls-test` file. Use a local host and port, the `kodiflow_test` database, and test-only credentials. Keep the bootstrap URL password consistent with `RLS_TEST_POSTGRES_PASSWORD`; the application and system URLs must use the dedicated `kodiflow_app` and `kodiflow_system` roles. Do not commit `.env.rls-test`.
+1. Configure the `RLS_TEST_*` values from `.env.example` in the ignored local `.env.rls-test` file. Use a local host and port, the `kodiflow_test` database, and test-only credentials. Keep the bootstrap URL password consistent with `RLS_TEST_POSTGRES_PASSWORD`; the application and system URLs must use the dedicated non-bypass `kodiflow_app` and `kodiflow_system` roles. Do not commit `.env.rls-test`.
 2. Start the dedicated PostgreSQL container:
 
    ```powershell

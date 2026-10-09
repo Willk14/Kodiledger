@@ -996,7 +996,7 @@ async def test_concurrent_landlord_requests_remain_isolated_across_pool(rls_data
 
 
 @pytest.mark.asyncio
-async def test_system_session_remains_separate_and_bypasses_rls(rls_database):
+async def test_system_session_remains_separate_and_uses_explicit_system_rls_policy(rls_database):
     system_url = make_url(rls_database["system_url"]).set(drivername="postgresql+asyncpg")
     engine = create_async_engine(system_url, pool_size=1, max_overflow=0)
     try:
@@ -1005,14 +1005,20 @@ async def test_system_session_remains_separate_and_bypasses_rls(rls_database):
                 SELECT current_user,
                        (SELECT rolbypassrls FROM pg_roles WHERE rolname = current_user),
                        (SELECT count(*) FROM invoices
-                        WHERE landlord_id IN (:landlord_a, :landlord_b))
+                        WHERE landlord_id IN (:landlord_a, :landlord_b)),
+                       EXISTS (
+                           SELECT 1 FROM pg_policy
+                           WHERE polrelid = 'public.invoices'::regclass
+                             AND polname = 'kodiflow_system_access'
+                       )
             """), {
                 "landlord_a": rls_database["a"].landlord_id,
                 "landlord_b": rls_database["b"].landlord_id,
             })).one()
         assert row[0] == "kodiflow_system"
-        assert row[1] is True
+        assert row[1] is False
         assert row[2] == 2
+        assert row[3] is True
     finally:
         await engine.dispose()
 

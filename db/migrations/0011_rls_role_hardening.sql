@@ -7,6 +7,10 @@ BEGIN;
 
 -- ------------------------------------------------------------
 -- 1. Trusted system database role
+-- The system role is deliberately NOBYPASSRLS. Migration 0019 grants this
+-- role explicit access policies on the RLS-protected tables needed by trusted
+-- webhook/worker workflows. This works on managed PostgreSQL providers where
+-- application database owners cannot create BYPASSRLS roles.
 -- ------------------------------------------------------------
 
 DO $$
@@ -22,7 +26,7 @@ BEGIN
         NOCREATEDB
         NOCREATEROLE
         NOINHERIT
-        BYPASSRLS;
+        NOBYPASSRLS;
     END IF;
 END
 $$;

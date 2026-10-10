@@ -1,0 +1,78 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+
+from app.core.config import settings
+from app.core.database import SystemSessionLocal
+from app.integrations.events.kafka_publisher import KafkaEventPublisher
+from app.services.outbox_worker import OutboxWorker
+
+
+MAX_ATTEMPTS = 5
+
+
+logger = logging.getLogger(__name__)
+
+
+async def run_forever() -> None:
+    publisher = KafkaEventPublisher()
+
+    await publisher.start()
+
+    worker = OutboxWorker(
+        SystemSessionLocal,
+        publisher,
+        batch_size=settings.OUTBOX_BATCH_SIZE,
+        max_attempts=MAX_ATTEMPTS,
+        lock_timeout_seconds=settings.OUTBOX_LOCK_TIMEOUT_SECONDS,
+    )
+
+    logger.info(
+        "Outbox worker started poll_interval_ms=%d batch_size=%d "
+        "max_batch_wait_ms=%d lock_timeout_seconds=%d max_attempts=%d",
+        settings.OUTBOX_POLL_INTERVAL_MS,
+        settings.OUTBOX_BATCH_SIZE,
+        settings.OUTBOX_MAX_BATCH_WAIT_MS,
+        settings.OUTBOX_LOCK_TIMEOUT_SECONDS,
+        MAX_ATTEMPTS,
+    )
+
+    try:
+        while True:
+            try:
+                processed = await worker.run_once()
+
+                if processed:
+                    logger.info(
+                        "Outbox worker processed %s event(s)",
+                        processed,
+                    )
+
+            except asyncio.CancelledError:
+                raise
+
+            except Exception:
+                logger.exception("Outbox worker iteration failed")
+
+            await asyncio.sleep(settings.OUTBOX_POLL_INTERVAL_MS / 1000)
+
+    finally:
+        await publisher.stop()
+        logger.info("Kafka publisher stopped")
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
+    try:
+        asyncio.run(run_forever())
+    except KeyboardInterrupt:
+        logger.info("Outbox worker stopped")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,4378 @@
+from __future__ import annotations
+
+import asyncio
+from datetime import date
+from decimal import Decimal
+from pathlib import Path
+
+from uuid import uuid4
+
+import httpx
+import pytest
+import pytest_asyncio
+from dotenv import dotenv_values
+from sqlalchemy import text
+from app.repositories.outbox_event_repository import OutboxEventRepository
+from app.repositories.invoice_repository import InvoiceRepository
+from app.repositories.payment_allocation_repository import PaymentAllocationRepository
+from app.repositories.payment_credit_repository import PaymentCreditRepository
+from app.repositories.payment_transaction_repository import PaymentTransactionRepository
+from app.services.invoice_allocation_service import InvoiceAllocationService
+from app.services.outbox_worker import OutboxWorker
+from app.services.test_event_publisher import TestEventPublisher
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
+from sqlalchemy.engine import make_url
+
+from app.core.database import get_system_db
+from app.core.config import settings
+from app.main import app
+
+
+ROOT = Path(__file__).resolve().parents[3]
+RLS_TEST_ENV = ROOT / ".env.rls-test"
+RLS_TEST_VALUES = {
+    key: value for key, value in dotenv_values(RLS_TEST_ENV).items() if value
+}
+RLS_SYSTEM_DATABASE_URL = RLS_TEST_VALUES.get("RLS_TEST_SYSTEM_DATABASE_URL")
+if not RLS_SYSTEM_DATABASE_URL:
+    pytest.skip(
+        "Webhook PostgreSQL integration tests require .env.rls-test.",
+        allow_module_level=True,
+    )
+
+test_system_engine = create_async_engine(
+    make_url(RLS_SYSTEM_DATABASE_URL).set(drivername="postgresql+asyncpg"),
+    echo=False,
+    future=True,
+    poolclass=NullPool,
+)
+
+TestSystemSessionLocal = async_sessionmaker(
+    test_system_engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+)
+
+
+BASE_URL = "http://test"
+WEBHOOK_URL = f"{BASE_URL}/api/v1/webhooks/mpesa"
+
+LANDLORD_ID = "11111111-1111-1111-1111-111111111111"
+TENANT_ID = "55555555-5555-5555-5555-555555555555"
+UNIT_ID = "33333333-3333-3333-3333-333333333333"
+TENANT_PHONE = "254798765432"
+
+
+def _webhook_client(timeout: float = 30.0) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url=BASE_URL,
+        timeout=timeout,
+    )
+
+
+async def _test_system_db():
+    async with TestSystemSessionLocal() as session:
+        yield session
+
+
+async def _clean_webhook_test_data(db: AsyncSession) -> None:
+    transaction_ids = "SELECT id FROM payment_transactions WHERE mpesa_receipt_number LIKE 'IT-%'"
+    await db.execute(text(f"DELETE FROM outbox_events WHERE idempotency_key LIKE 'IT-%' OR aggregate_id IN ({transaction_ids})"))
+    await db.execute(text(f"""
+        DELETE FROM payment_credit_applications
+        WHERE payment_credit_id IN (
+            SELECT id FROM payment_credits WHERE payment_transaction_id IN ({transaction_ids})
+        ) OR invoice_id IN (SELECT id FROM invoices WHERE invoice_number LIKE 'IT-%')
+    """))
+    await db.execute(text(f"DELETE FROM payment_credits WHERE payment_transaction_id IN ({transaction_ids})"))
+    await db.execute(text(f"DELETE FROM payment_allocations WHERE payment_transaction_id IN ({transaction_ids})"))
+    await db.execute(text(f"DELETE FROM ledger_entries WHERE payment_transaction_id IN ({transaction_ids}) OR invoice_id IN (SELECT id FROM invoices WHERE invoice_number LIKE 'IT-%')"))
+    await db.execute(text("DELETE FROM unassigned_payments WHERE mpesa_receipt_number LIKE 'IT-%'"))
+    await db.execute(text("DELETE FROM payment_transactions WHERE mpesa_receipt_number LIKE 'IT-%'"))
+    await db.execute(text("DELETE FROM payment_processing WHERE mpesa_receipt_number LIKE 'IT-%'"))
+    await db.execute(text("DELETE FROM raw_payment_webhooks WHERE mpesa_receipt_number LIKE 'IT-%' OR merchant_request_id LIKE 'IT-%'"))
+    await db.execute(text("DELETE FROM stk_push_requests WHERE checkout_request_id LIKE 'IT-%'"))
+    await db.execute(text("DELETE FROM invoices WHERE invoice_number LIKE 'IT-%'"))
+    await db.commit()
+
+
+@pytest_asyncio.fixture(scope="session", autouse=True)
+async def webhook_test_database():
+    async with TestSystemSessionLocal() as db:
+        await _clean_webhook_test_data(db)
+        await db.execute(text("""
+            INSERT INTO landlords (id, full_name, email, phone_number, business_shortcode)
+            VALUES (:id, 'Webhook Integration Landlord', 'webhook-integration@example.test', '254799000001', :shortcode)
+            ON CONFLICT (id) DO UPDATE SET full_name = EXCLUDED.full_name,
+                                          business_shortcode = EXCLUDED.business_shortcode
+        """), {"id": LANDLORD_ID, "shortcode": settings.MPESA_SHORTCODE})
+        await db.execute(text("""
+            INSERT INTO properties (id, landlord_id, name, county, town_location, total_units)
+            VALUES ('22222222-2222-2222-2222-222222222222', :landlord_id,
+                    'Webhook Integration Property', 'Test County', 'Test Town', 1)
+            ON CONFLICT (id) DO UPDATE SET landlord_id = EXCLUDED.landlord_id
+        """), {"landlord_id": LANDLORD_ID})
+        await db.execute(text("""
+            INSERT INTO units (id, property_id, landlord_id, unit_number, base_rent,
+                               garbage_fee, water_rate_per_unit, is_occupied)
+            VALUES (:id, '22222222-2222-2222-2222-222222222222', :landlord_id,
+                    'A4', 15000, 500, 150, TRUE)
+            ON CONFLICT (id) DO UPDATE SET landlord_id = EXCLUDED.landlord_id
+        """), {"id": UNIT_ID, "landlord_id": LANDLORD_ID})
+        await db.execute(text("""
+            INSERT INTO tenants (id, landlord_id, unit_id, full_name, primary_phone,
+                                 lease_start_date, deposit_amount)
+            VALUES (:id, :landlord_id, :unit_id, 'Webhook Integration Tenant',
+                    :phone, :lease_start, 15000)
+            ON CONFLICT (id) DO UPDATE SET primary_phone = EXCLUDED.primary_phone,
+                                          landlord_id = EXCLUDED.landlord_id,
+                                          unit_id = EXCLUDED.unit_id
+        """), {"id": TENANT_ID, "landlord_id": LANDLORD_ID, "unit_id": UNIT_ID,
+              "phone": TENANT_PHONE, "lease_start": date(2026, 1, 1)})
+        await db.commit()
+
+    yield
+
+    async with TestSystemSessionLocal() as db:
+        await _clean_webhook_test_data(db)
+        await db.execute(text("DELETE FROM tenants WHERE id = :id"), {"id": TENANT_ID})
+        await db.execute(text("DELETE FROM units WHERE id = :id"), {"id": UNIT_ID})
+        await db.execute(text("DELETE FROM properties WHERE id = '22222222-2222-2222-2222-222222222222'"))
+        await db.execute(text("DELETE FROM landlords WHERE id = :id"), {"id": LANDLORD_ID})
+        await db.commit()
+        await test_system_engine.dispose()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def webhook_api_test_database():
+    previous = app.dependency_overrides.get(get_system_db)
+    app.dependency_overrides[get_system_db] = _test_system_db
+    try:
+        yield
+    finally:
+        if previous is None:
+            app.dependency_overrides.pop(get_system_db, None)
+        else:
+            app.dependency_overrides[get_system_db] = previous
+
+
+def callback_payload(
+    receipt: str,
+    merchant: str,
+    checkout: str,
+    amount: int,
+    payer_phone: str = TENANT_PHONE,
+):
+    return {
+        "Body": {
+            "stkCallback": {
+                "MerchantRequestID": merchant,
+                "CheckoutRequestID": checkout,
+                "ResultCode": 0,
+                "ResultDesc": "The service request is processed successfully.",
+                "CallbackMetadata": {
+                    "Item": [
+                        {"Name": "Amount", "Value": amount},
+                        {
+                            "Name": "MpesaReceiptNumber",
+                            "Value": receipt,
+                        },
+                        {
+                            "Name": "PhoneNumber",
+                            "Value": payer_phone,
+                        },
+                    ]
+                },
+            }
+        }
+    }
+
+
+async def _record_stk_request(merchant_request_id: str, checkout_request_id: str) -> None:
+    """Seed a successful Daraja STK initiation before its callback arrives."""
+    async with TestSystemSessionLocal() as db:
+        await db.execute(
+            text("""
+                INSERT INTO stk_push_requests (merchant_request_id, checkout_request_id)
+                VALUES (:merchant, :checkout)
+                ON CONFLICT (checkout_request_id) DO NOTHING
+            """),
+            {"merchant": merchant_request_id, "checkout": checkout_request_id},
+        )
+        await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_callback_with_mismatched_stk_identifiers_is_rejected_before_inbox():
+    suffix = uuid4().hex[:12]
+    merchant = f"IT-TRUSTED-MERCHANT-{suffix}"
+    checkout = f"IT-TRUSTED-CHECKOUT-{suffix}"
+    receipt = f"IT-UNTRUSTED-RECEIPT-{suffix}"
+    await _record_stk_request(merchant, checkout)
+
+    async with _webhook_client() as client:
+        response = await client.post(
+            WEBHOOK_URL,
+            json=callback_payload(
+                receipt,
+                f"IT-FORGED-MERCHANT-{suffix}",
+                checkout,
+                150,
+            ),
+        )
+
+    assert response.status_code == 401
+
+    async with TestSystemSessionLocal() as db:
+        inbox_count = await db.scalar(
+            text("""
+                SELECT count(*) FROM raw_payment_webhooks
+                WHERE merchant_request_id = :merchant
+                   OR mpesa_receipt_number = :receipt
+            """),
+            {"merchant": f"IT-FORGED-MERCHANT-{suffix}", "receipt": receipt},
+        )
+        request_status = await db.scalar(
+            text("""
+                SELECT request_status FROM stk_push_requests
+                WHERE checkout_request_id = :checkout
+            """),
+            {"checkout": checkout},
+        )
+        assert inbox_count == 0
+        assert request_status == "PENDING"
+        await db.execute(
+            text("DELETE FROM stk_push_requests WHERE checkout_request_id = :checkout"),
+            {"checkout": checkout},
+        )
+        await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_matched_webhook_is_idempotent():
+    suffix = uuid4().hex[:12]
+    receipt = f"IT-RECEIPT-{suffix}"
+    merchant = f"IT-MERCHANT-{suffix}"
+    checkout = f"IT-CHECKOUT-{suffix}"
+    invoice_number = f"IT-INVOICE-{suffix}"
+    amount = 150
+
+    invoice_id = None
+    raw_webhook_ids: list[str] = []
+
+    async with TestSystemSessionLocal() as db:
+        result = await db.execute(
+            text(
+                """
+                INSERT INTO invoices (
+                    landlord_id,
+                    unit_id,
+                    tenant_id,
+                    invoice_number,
+                    billing_month,
+                    rent_amount,
+                    water_amount,
+                    garbage_amount,
+                    security_amount,
+                    due_date,
+                    is_paid
+                )
+                VALUES (
+                    :landlord_id,
+                    :unit_id,
+                    :tenant_id,
+                    :invoice_number,
+                    CURRENT_DATE,
+                    :rent_amount,
+                    0,
+                    0,
+                    0,
+                    CURRENT_DATE,
+                    false
+                )
+                RETURNING id
+                """
+            ),
+            {
+                "landlord_id": LANDLORD_ID,
+                "unit_id": UNIT_ID,
+                "tenant_id": TENANT_ID,
+                "invoice_number": invoice_number,
+                "rent_amount": amount,
+            },
+        )
+
+        invoice_id = str(result.scalar_one())
+        await db.commit()
+
+    try:
+        await _record_stk_request(merchant, checkout)
+        async with _webhook_client() as client:
+            first = await client.post(
+                WEBHOOK_URL,
+                json=callback_payload(
+                    receipt,
+                    merchant,
+                    checkout,
+                    amount,
+                ),
+            )
+
+            assert first.status_code == 200
+            first_body = first.json()
+
+            assert first_body["ResultCode"] == 0
+            assert (
+                first_body["ResultDesc"]
+                == "Webhook processed successfully"
+            )
+            assert first_body["reconciliation"]["status"] == "MATCHED"
+
+            second = await client.post(
+                WEBHOOK_URL,
+                json=callback_payload(
+                    receipt,
+                    merchant,
+                    checkout,
+                    amount,
+                ),
+            )
+
+            assert second.status_code == 200
+            second_body = second.json()
+
+            assert second_body["ResultCode"] == 0
+            assert (
+                second_body["ResultDesc"]
+                == "Duplicate webhook ignored"
+            )
+
+        async with TestSystemSessionLocal() as db:
+            raw_result = await db.execute(
+                text(
+                    """
+                    SELECT id
+                    FROM raw_payment_webhooks
+                    WHERE mpesa_receipt_number = :receipt
+                    ORDER BY created_at
+                    """
+                ),
+                {"receipt": receipt},
+            )
+            raw_webhook_ids = [
+                str(row[0]) for row in raw_result.fetchall()
+            ]
+
+            processing_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM payment_processing
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            transaction_result = await db.execute(
+                text(
+                    """
+                    SELECT id
+                    FROM payment_transactions
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+            transaction_id = transaction_result.scalar_one()
+
+            allocation_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM payment_allocations
+                    WHERE payment_transaction_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": str(transaction_id)},
+            )
+
+            ledger_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM ledger_entries
+                    WHERE payment_transaction_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": str(transaction_id)},
+            )
+
+            outbox_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM outbox_events
+                    WHERE aggregate_id = :aggregate_id
+                    """
+                ),
+                {"aggregate_id": str(transaction_id)},
+            )
+
+            invoice_paid = await db.scalar(
+                text(
+                    """
+                    SELECT is_paid
+                    FROM invoices
+                    WHERE id = :invoice_id
+                    """
+                ),
+                {"invoice_id": invoice_id},
+            )
+
+            assert processing_count == 1
+            assert allocation_count == 1
+            assert ledger_count == 1
+            assert outbox_count == 1
+            assert invoice_paid is True
+
+            # Both deliveries are retained as raw audit records.
+            assert len(raw_webhook_ids) == 2
+
+    finally:
+        async with TestSystemSessionLocal() as db:
+            transaction_result = await db.execute(
+                text(
+                    """
+                    SELECT id
+                    FROM payment_transactions
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+            transaction_id = transaction_result.scalar_one_or_none()
+
+            if transaction_id:
+                await db.execute(
+                    text(
+                        """
+                        DELETE FROM outbox_events
+                        WHERE aggregate_id = :aggregate_id
+                        """
+                    ),
+                    {"aggregate_id": str(transaction_id)},
+                )
+
+                await db.execute(
+                    text(
+                        """
+                        DELETE FROM ledger_entries
+                        WHERE payment_transaction_id = :transaction_id
+                        """
+                    ),
+                    {"transaction_id": str(transaction_id)},
+                )
+
+                await db.execute(
+                    text(
+                        """
+                        DELETE FROM payment_allocations
+                        WHERE payment_transaction_id = :transaction_id
+                        """
+                    ),
+                    {"transaction_id": str(transaction_id)},
+                )
+
+                await db.execute(
+                    text(
+                        """
+                        DELETE FROM payment_transactions
+                        WHERE id = :transaction_id
+                        """
+                    ),
+                    {"transaction_id": str(transaction_id)},
+                )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_processing
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM raw_payment_webhooks
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM invoices
+                    WHERE id = :invoice_id
+                    """
+                ),
+                {"invoice_id": invoice_id},
+            )
+
+            await db.commit()
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_successful_webhook_creates_unassigned_payment():
+    suffix = uuid4().hex[:12]
+
+    receipt = f"IT-UNASSIGNED-{suffix}"
+    merchant = f"IT-UNASSIGNED-MERCHANT-{suffix}"
+    checkout = f"IT-UNASSIGNED-CHECKOUT-{suffix}"
+
+    # Deliberately use a phone number that does not belong
+    # to an active tenant for Landlord A.
+    unmatched_phone = "254700000001"
+    amount = 250
+
+    await _record_stk_request(merchant, checkout)
+
+    async with _webhook_client() as client:
+        response = await client.post(
+            WEBHOOK_URL,
+            json={
+                "Body": {
+                    "stkCallback": {
+                        "MerchantRequestID": merchant,
+                        "CheckoutRequestID": checkout,
+                        "ResultCode": 0,
+                        "ResultDesc": (
+                            "The service request is processed successfully."
+                        ),
+                        "CallbackMetadata": {
+                            "Item": [
+                                {
+                                    "Name": "Amount",
+                                    "Value": amount,
+                                },
+                                {
+                                    "Name": "MpesaReceiptNumber",
+                                    "Value": receipt,
+                                },
+                                {
+                                    "Name": "PhoneNumber",
+                                    "Value": unmatched_phone,
+                                },
+                            ]
+                        },
+                    }
+                }
+            },
+        )
+
+    assert response.status_code == 200
+
+    body = response.json()
+
+    assert body["ResultCode"] == 0
+    assert body["ResultDesc"] == "Webhook processed successfully"
+    assert body["reconciliation"]["status"] == "UNASSIGNED"
+    assert body["reconciliation"]["mpesa_receipt"] == receipt
+
+    transaction_id = body["reconciliation"]["payment_transaction_id"]
+
+    async with TestSystemSessionLocal() as db:
+        transaction = await db.execute(
+            text(
+                """
+                SELECT
+                    id,
+                    tenant_id,
+                    amount,
+                    status
+                FROM payment_transactions
+                WHERE mpesa_receipt_number = :receipt
+                """
+            ),
+            {"receipt": receipt},
+        )
+
+        row = transaction.mappings().first()
+
+        assert row is not None
+        assert str(row["id"]) == transaction_id
+        assert row["tenant_id"] is None
+        assert row["amount"] == amount
+        assert str(row["status"]) == "COMPLETED"
+
+        unassigned = await db.execute(
+            text(
+                """
+                SELECT
+                    mpesa_receipt_number,
+                    amount,
+                    payer_phone,
+                    landlord_id
+                FROM unassigned_payments
+                WHERE mpesa_receipt_number = :receipt
+                """
+            ),
+            {"receipt": receipt},
+        )
+
+        unassigned_row = unassigned.mappings().first()
+
+        assert unassigned_row is not None
+        assert unassigned_row["amount"] == amount
+        assert unassigned_row["payer_phone"] == unmatched_phone
+        assert str(unassigned_row["landlord_id"]) == LANDLORD_ID
+
+        allocation_count = await db.scalar(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM payment_allocations
+                WHERE payment_transaction_id = :transaction_id
+                """
+            ),
+            {"transaction_id": transaction_id},
+        )
+
+        ledger_count = await db.scalar(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM ledger_entries
+                WHERE payment_transaction_id = :transaction_id
+                """
+            ),
+            {"transaction_id": transaction_id},
+        )
+
+        outbox_count = await db.scalar(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM outbox_events
+                WHERE aggregate_id = :transaction_id
+                """
+            ),
+            {"transaction_id": transaction_id},
+        )
+
+        assert allocation_count == 0
+        assert ledger_count == 0
+        assert outbox_count == 0
+
+        processing_status = await db.scalar(
+            text(
+                """
+                SELECT status
+                FROM payment_processing
+                WHERE mpesa_receipt_number = :receipt
+                """
+            ),
+            {"receipt": receipt},
+        )
+
+        assert processing_status == "UNASSIGNED"
+
+        await db.execute(
+            text(
+                """
+                DELETE FROM unassigned_payments
+                WHERE mpesa_receipt_number = :receipt
+                """
+            ),
+            {"receipt": receipt},
+        )
+
+        await db.execute(
+            text(
+                """
+                DELETE FROM payment_transactions
+                WHERE id = :transaction_id
+                """
+            ),
+            {"transaction_id": transaction_id},
+        )
+
+        await db.execute(
+            text(
+                """
+                DELETE FROM payment_processing
+                WHERE mpesa_receipt_number = :receipt
+                """
+            ),
+            {"receipt": receipt},
+        )
+
+        await db.execute(
+            text(
+                """
+                DELETE FROM raw_payment_webhooks
+                WHERE mpesa_receipt_number = :receipt
+                """
+            ),
+            {"receipt": receipt},
+        )
+
+        await db.commit()
+
+        
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_failed_webhook_is_audited_without_financial_processing():
+    suffix = uuid4().hex[:12]
+
+    merchant = f"IT-FAILED-MERCHANT-{suffix}"
+    checkout = f"IT-FAILED-CHECKOUT-{suffix}"
+    receipt = f"IT-FAILED-{suffix}"
+
+    result_code = 1032
+    result_desc = "Request cancelled by user"
+
+    try:
+        await _record_stk_request(merchant, checkout)
+        async with _webhook_client() as client:
+            response = await client.post(
+                WEBHOOK_URL,
+                json={
+                    "Body": {
+                        "stkCallback": {
+                            "MerchantRequestID": merchant,
+                            "CheckoutRequestID": checkout,
+                            "ResultCode": result_code,
+                            "ResultDesc": result_desc,
+                        }
+                    }
+                },
+            )
+
+        assert response.status_code == 200
+
+        body = response.json()
+
+        # The webhook endpoint acknowledges receipt of the failed callback.
+        assert body["ResultCode"] == 0
+
+        async with TestSystemSessionLocal() as db:
+            raw_result = await db.execute(
+                text(
+                    """
+                    SELECT
+                        id,
+                        merchant_request_id,
+                        checkout_request_id,
+                        mpesa_receipt_number,
+                        raw_payload,
+                        processed,
+                        error_log
+                    FROM raw_payment_webhooks
+                    WHERE merchant_request_id = :merchant
+                      AND checkout_request_id = :checkout
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """
+                ),
+                {
+                    "merchant": merchant,
+                    "checkout": checkout,
+                },
+            )
+
+            raw_row = raw_result.mappings().first()
+
+            assert raw_row is not None
+            assert raw_row["merchant_request_id"] == merchant
+            assert raw_row["checkout_request_id"] == checkout
+            assert raw_row["processed"] is True
+
+            # Failed callbacks do not contain successful-payment metadata.
+            assert raw_row["mpesa_receipt_number"] is None
+
+            raw_payload = raw_row["raw_payload"]
+
+            assert raw_payload["Body"]["stkCallback"]["ResultCode"] == result_code
+            assert (
+                raw_payload["Body"]["stkCallback"]["ResultDesc"]
+                == result_desc
+            )
+
+            processing_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM payment_processing
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            transaction_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM payment_transactions
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            assert processing_count == 0
+            assert transaction_count == 0
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM raw_payment_webhooks
+                    WHERE merchant_request_id = :merchant
+                      AND checkout_request_id = :checkout
+                    """
+                ),
+                {
+                    "merchant": merchant,
+                    "checkout": checkout,
+                },
+            )
+
+            await db.commit()
+
+    except Exception:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM raw_payment_webhooks
+                    WHERE merchant_request_id = :merchant
+                      AND checkout_request_id = :checkout
+                    """
+                ),
+                {
+                    "merchant": merchant,
+                    "checkout": checkout,
+                },
+            )
+            await db.commit()
+        raise
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_concurrent_duplicate_webhooks_create_one_financial_chain():
+    suffix = uuid4().hex[:12]
+
+    receipt = f"IT-CONCURRENT-{suffix}"
+    merchant = f"IT-CONCURRENT-MERCHANT-{suffix}"
+    checkout = f"IT-CONCURRENT-CHECKOUT-{suffix}"
+    invoice_number = f"IT-CONCURRENT-INVOICE-{suffix}"
+    amount = 150
+
+    invoice_id = None
+
+    async with TestSystemSessionLocal() as db:
+        result = await db.execute(
+            text(
+                """
+                INSERT INTO invoices (
+                    landlord_id,
+                    unit_id,
+                    tenant_id,
+                    invoice_number,
+                    billing_month,
+                    rent_amount,
+                    water_amount,
+                    garbage_amount,
+                    security_amount,
+                    due_date,
+                    is_paid
+                )
+                VALUES (
+                    :landlord_id,
+                    :unit_id,
+                    :tenant_id,
+                    :invoice_number,
+                    CURRENT_DATE,
+                    :rent_amount,
+                    0,
+                    0,
+                    0,
+                    CURRENT_DATE,
+                    false
+                )
+                RETURNING id
+                """
+            ),
+            {
+                "landlord_id": LANDLORD_ID,
+                "unit_id": UNIT_ID,
+                "tenant_id": TENANT_ID,
+                "invoice_number": invoice_number,
+                "rent_amount": amount,
+            },
+        )
+
+        invoice_id = str(result.scalar_one())
+        await db.commit()
+
+    payload = callback_payload(
+        receipt,
+        merchant,
+        checkout,
+        amount,
+    )
+    await _record_stk_request(merchant, checkout)
+
+    try:
+        async with _webhook_client() as client:
+            responses = await asyncio.gather(
+                client.post(WEBHOOK_URL, json=payload),
+                client.post(WEBHOOK_URL, json=payload),
+            )
+
+        assert len(responses) == 2
+        assert all(response.status_code == 200 for response in responses)
+
+        bodies = [response.json() for response in responses]
+
+        result_descs = {body["ResultDesc"] for body in bodies}
+
+        assert "Webhook processed successfully" in result_descs
+        assert "Duplicate webhook ignored" in result_descs
+
+        async with TestSystemSessionLocal() as db:
+            processing_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM payment_processing
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            transaction_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM payment_transactions
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            allocation_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM payment_allocations
+                    WHERE payment_transaction_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number = :receipt
+                    )
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            ledger_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM ledger_entries
+                    WHERE payment_transaction_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number = :receipt
+                    )
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            outbox_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM outbox_events
+                    WHERE aggregate_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number = :receipt
+                    )
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            invoice_paid = await db.scalar(
+                text(
+                    """
+                    SELECT is_paid
+                    FROM invoices
+                    WHERE id = :invoice_id
+                    """
+                ),
+                {"invoice_id": invoice_id},
+            )
+
+            assert processing_count == 1
+            assert transaction_count == 1
+            assert allocation_count == 1
+            assert ledger_count == 1
+            assert outbox_count == 1
+            assert invoice_paid is True
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE aggregate_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number = :receipt
+                    )
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM ledger_entries
+                    WHERE payment_transaction_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number = :receipt
+                    )
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_allocations
+                    WHERE payment_transaction_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number = :receipt
+                    )
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_transactions
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_processing
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM raw_payment_webhooks
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM invoices
+                    WHERE id = :invoice_id
+                    """
+                ),
+                {"invoice_id": invoice_id},
+            )
+
+            await db.commit()
+
+    except Exception:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE aggregate_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number = :receipt
+                    )
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM ledger_entries
+                    WHERE payment_transaction_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number = :receipt
+                    )
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_allocations
+                    WHERE payment_transaction_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number = :receipt
+                    )
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_transactions
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_processing
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM raw_payment_webhooks
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            if invoice_id:
+                await db.execute(
+                    text(
+                        """
+                        DELETE FROM invoices
+                        WHERE id = :invoice_id
+                        """
+                    ),
+                    {"invoice_id": invoice_id},
+                )
+
+            await db.commit()
+
+        raise
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_overpayment_allocates_invoice_and_creates_payment_credit():
+    suffix = uuid4().hex[:12]
+
+    receipt = f"IT-OVERPAYMENT-{suffix}"
+    merchant = f"IT-OVERPAYMENT-MERCHANT-{suffix}"
+    checkout = f"IT-OVERPAYMENT-CHECKOUT-{suffix}"
+    invoice_number = f"IT-OVERPAYMENT-INVOICE-{suffix}"
+
+    invoice_amount = 150
+    payment_amount = 200
+    expected_credit = 50
+
+    invoice_id = None
+
+    await _record_stk_request(merchant, checkout)
+
+    async with TestSystemSessionLocal() as db:
+        result = await db.execute(
+            text(
+                """
+                INSERT INTO invoices (
+                    landlord_id,
+                    unit_id,
+                    tenant_id,
+                    invoice_number,
+                    billing_month,
+                    rent_amount,
+                    water_amount,
+                    garbage_amount,
+                    security_amount,
+                    due_date,
+                    is_paid
+                )
+                VALUES (
+                    :landlord_id,
+                    :unit_id,
+                    :tenant_id,
+                    :invoice_number,
+                    CURRENT_DATE,
+                    :rent_amount,
+                    0,
+                    0,
+                    0,
+                    CURRENT_DATE,
+                    false
+                )
+                RETURNING id
+                """
+            ),
+            {
+                "landlord_id": LANDLORD_ID,
+                "unit_id": UNIT_ID,
+                "tenant_id": TENANT_ID,
+                "invoice_number": invoice_number,
+                "rent_amount": invoice_amount,
+            },
+        )
+
+        invoice_id = str(result.scalar_one())
+        await db.commit()
+
+    try:
+        async with _webhook_client() as client:
+            response = await client.post(
+                WEBHOOK_URL,
+                json=callback_payload(
+                    receipt,
+                    merchant,
+                    checkout,
+                    payment_amount,
+                ),
+            )
+
+        assert response.status_code == 200
+
+        body = response.json()
+
+        assert body["ResultCode"] == 0
+        assert body["ResultDesc"] == "Webhook processed successfully"
+        assert body["reconciliation"]["status"] == "MATCHED"
+
+        transaction_id = body["reconciliation"]["payment_transaction_id"]
+
+        async with TestSystemSessionLocal() as db:
+            allocation_result = await db.execute(
+                text(
+                    """
+                    SELECT
+                        amount,
+                        status,
+                        invoice_id
+                    FROM payment_allocations
+                    WHERE payment_transaction_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            allocation = allocation_result.mappings().first()
+
+            assert allocation is not None
+            assert allocation["amount"] == invoice_amount
+            assert str(allocation["status"]) == "ALLOCATED"
+            assert str(allocation["invoice_id"]) == invoice_id
+
+            credit_result = await db.execute(
+                text(
+                    """
+                    SELECT
+                        amount,
+                        status,
+                        tenant_id,
+                        payment_transaction_id
+                    FROM payment_credits
+                    WHERE payment_transaction_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            credit = credit_result.mappings().first()
+
+            assert credit is not None
+            assert credit["amount"] == expected_credit
+            assert str(credit["status"]) == "AVAILABLE"
+            assert str(credit["tenant_id"]) == TENANT_ID
+            assert str(credit["payment_transaction_id"]) == transaction_id
+
+            invoice_paid = await db.scalar(
+                text(
+                    """
+                    SELECT is_paid
+                    FROM invoices
+                    WHERE id = :invoice_id
+                    """
+                ),
+                {"invoice_id": invoice_id},
+            )
+
+            assert invoice_paid is True
+
+            transaction_amount = await db.scalar(
+                text(
+                    """
+                    SELECT amount
+                    FROM payment_transactions
+                    WHERE id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            assert transaction_amount == payment_amount
+
+            ledger_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM ledger_entries
+                    WHERE payment_transaction_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            outbox_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM outbox_events
+                    WHERE aggregate_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            assert ledger_count == 1
+            assert outbox_count == 1
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE aggregate_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM ledger_entries
+                    WHERE payment_transaction_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_credits
+                    WHERE payment_transaction_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_allocations
+                    WHERE payment_transaction_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_transactions
+                    WHERE id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_processing
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM raw_payment_webhooks
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM invoices
+                    WHERE id = :invoice_id
+                    """
+                ),
+                {"invoice_id": invoice_id},
+            )
+
+            await db.commit()
+
+    except Exception:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE aggregate_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number = :receipt
+                    )
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM ledger_entries
+                    WHERE payment_transaction_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number = :receipt
+                    )
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_credits
+                    WHERE payment_transaction_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number = :receipt
+                    )
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_allocations
+                    WHERE payment_transaction_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number = :receipt
+                    )
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_transactions
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_processing
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM raw_payment_webhooks
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            if invoice_id:
+                await db.execute(
+                    text(
+                        """
+                        DELETE FROM invoices
+                        WHERE id = :invoice_id
+                        """
+                    ),
+                    {"invoice_id": invoice_id},
+                )
+
+            await db.commit()
+
+        raise
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_partial_payment_allocates_invoice_without_payment_credit():
+    suffix = uuid4().hex[:12]
+
+    receipt = f"IT-PARTIAL-{suffix}"
+    merchant = f"IT-PARTIAL-MERCHANT-{suffix}"
+    checkout = f"IT-PARTIAL-CHECKOUT-{suffix}"
+    invoice_number = f"IT-PARTIAL-INVOICE-{suffix}"
+
+    invoice_amount = 200
+    payment_amount = 150
+
+    invoice_id = None
+    transaction_id = None
+
+    await _record_stk_request(merchant, checkout)
+
+    async with TestSystemSessionLocal() as db:
+        result = await db.execute(
+            text(
+                """
+                INSERT INTO invoices (
+                    landlord_id,
+                    unit_id,
+                    tenant_id,
+                    invoice_number,
+                    billing_month,
+                    rent_amount,
+                    water_amount,
+                    garbage_amount,
+                    security_amount,
+                    due_date,
+                    is_paid
+                )
+                VALUES (
+                    :landlord_id,
+                    :unit_id,
+                    :tenant_id,
+                    :invoice_number,
+                    CURRENT_DATE,
+                    :rent_amount,
+                    0,
+                    0,
+                    0,
+                    CURRENT_DATE,
+                    false
+                )
+                RETURNING id
+                """
+            ),
+            {
+                "landlord_id": LANDLORD_ID,
+                "unit_id": UNIT_ID,
+                "tenant_id": TENANT_ID,
+                "invoice_number": invoice_number,
+                "rent_amount": invoice_amount,
+            },
+        )
+
+        invoice_id = str(result.scalar_one())
+        await db.commit()
+
+    try:
+        async with _webhook_client() as client:
+            response = await client.post(
+                WEBHOOK_URL,
+                json=callback_payload(
+                    receipt,
+                    merchant,
+                    checkout,
+                    payment_amount,
+                ),
+            )
+
+        assert response.status_code == 200
+
+        body = response.json()
+
+        assert body["ResultCode"] == 0
+        assert body["ResultDesc"] == "Webhook processed successfully"
+        assert body["reconciliation"]["status"] == "MATCHED"
+
+        transaction_id = body["reconciliation"]["payment_transaction_id"]
+
+        async with TestSystemSessionLocal() as db:
+            allocation_result = await db.execute(
+                text(
+                    """
+                    SELECT
+                        amount,
+                        status,
+                        invoice_id
+                    FROM payment_allocations
+                    WHERE payment_transaction_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            allocation = allocation_result.mappings().first()
+
+            assert allocation is not None
+            assert allocation["amount"] == payment_amount
+            assert str(allocation["status"]) == "ALLOCATED"
+            assert str(allocation["invoice_id"]) == invoice_id
+
+            invoice_paid = await db.scalar(
+                text(
+                    """
+                    SELECT is_paid
+                    FROM invoices
+                    WHERE id = :invoice_id
+                    """
+                ),
+                {"invoice_id": invoice_id},
+            )
+
+            assert invoice_paid is False
+
+            remaining_amount = await db.scalar(
+                text(
+                    """
+                    SELECT
+                        (
+                            rent_amount
+                            + water_amount
+                            + garbage_amount
+                            + security_amount
+                        ) - COALESCE(
+                            (
+                                SELECT SUM(pa.amount)
+                                FROM payment_allocations pa
+                                WHERE pa.invoice_id = invoices.id
+                                  AND pa.status = 'ALLOCATED'
+                            ),
+                            0
+                        )
+                    FROM invoices
+                    WHERE id = :invoice_id
+                    """
+                ),
+                {"invoice_id": invoice_id},
+            )
+
+            assert remaining_amount == invoice_amount - payment_amount
+
+            credit_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM payment_credits
+                    WHERE payment_transaction_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            assert credit_count == 0
+
+            transaction_amount = await db.scalar(
+                text(
+                    """
+                    SELECT amount
+                    FROM payment_transactions
+                    WHERE id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            assert transaction_amount == payment_amount
+
+            ledger_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM ledger_entries
+                    WHERE payment_transaction_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            outbox_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM outbox_events
+                    WHERE aggregate_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            assert ledger_count == 1
+            assert outbox_count == 1
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE aggregate_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM ledger_entries
+                    WHERE payment_transaction_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_allocations
+                    WHERE payment_transaction_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_transactions
+                    WHERE id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_processing
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM raw_payment_webhooks
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM invoices
+                    WHERE id = :invoice_id
+                    """
+                ),
+                {"invoice_id": invoice_id},
+            )
+
+            await db.commit()
+
+    except Exception:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE aggregate_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number = :receipt
+                    )
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM ledger_entries
+                    WHERE payment_transaction_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number = :receipt
+                    )
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_allocations
+                    WHERE payment_transaction_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number = :receipt
+                    )
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_transactions
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_processing
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM raw_payment_webhooks
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            if invoice_id:
+                await db.execute(
+                    text(
+                        """
+                        DELETE FROM invoices
+                        WHERE id = :invoice_id
+                        """
+                    ),
+                    {"invoice_id": invoice_id},
+                )
+
+            await db.commit()
+
+        raise
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_exact_payment_fully_allocates_invoice_without_payment_credit():
+    suffix = uuid4().hex[:12]
+
+    receipt = f"IT-EXACT-{suffix}"
+    merchant = f"IT-EXACT-MERCHANT-{suffix}"
+    checkout = f"IT-EXACT-CHECKOUT-{suffix}"
+    invoice_number = f"IT-EXACT-INVOICE-{suffix}"
+
+    invoice_amount = 200
+    payment_amount = 200
+
+    invoice_id = None
+    transaction_id = None
+
+    await _record_stk_request(merchant, checkout)
+
+    async with TestSystemSessionLocal() as db:
+        result = await db.execute(
+            text(
+                """
+                INSERT INTO invoices (
+                    landlord_id,
+                    unit_id,
+                    tenant_id,
+                    invoice_number,
+                    billing_month,
+                    rent_amount,
+                    water_amount,
+                    garbage_amount,
+                    security_amount,
+                    due_date,
+                    is_paid
+                )
+                VALUES (
+                    :landlord_id,
+                    :unit_id,
+                    :tenant_id,
+                    :invoice_number,
+                    CURRENT_DATE,
+                    :rent_amount,
+                    0,
+                    0,
+                    0,
+                    CURRENT_DATE,
+                    false
+                )
+                RETURNING id
+                """
+            ),
+            {
+                "landlord_id": LANDLORD_ID,
+                "unit_id": UNIT_ID,
+                "tenant_id": TENANT_ID,
+                "invoice_number": invoice_number,
+                "rent_amount": invoice_amount,
+            },
+        )
+
+        invoice_id = str(result.scalar_one())
+        await db.commit()
+
+    try:
+        async with _webhook_client() as client:
+            response = await client.post(
+                WEBHOOK_URL,
+                json=callback_payload(
+                    receipt,
+                    merchant,
+                    checkout,
+                    payment_amount,
+                ),
+            )
+
+        assert response.status_code == 200
+
+        body = response.json()
+
+        assert body["ResultCode"] == 0
+        assert body["ResultDesc"] == "Webhook processed successfully"
+        assert body["reconciliation"]["status"] == "MATCHED"
+
+        transaction_id = body["reconciliation"]["payment_transaction_id"]
+
+        async with TestSystemSessionLocal() as db:
+            allocation_result = await db.execute(
+                text(
+                    """
+                    SELECT
+                        amount,
+                        status,
+                        invoice_id
+                    FROM payment_allocations
+                    WHERE payment_transaction_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            allocation = allocation_result.mappings().first()
+
+            assert allocation is not None
+            assert allocation["amount"] == payment_amount
+            assert str(allocation["status"]) == "ALLOCATED"
+            assert str(allocation["invoice_id"]) == invoice_id
+
+            invoice_paid = await db.scalar(
+                text(
+                    """
+                    SELECT is_paid
+                    FROM invoices
+                    WHERE id = :invoice_id
+                    """
+                ),
+                {"invoice_id": invoice_id},
+            )
+
+            assert invoice_paid is True
+
+            remaining_amount = await db.scalar(
+                text(
+                    """
+                    SELECT
+                        (
+                            rent_amount
+                            + water_amount
+                            + garbage_amount
+                            + security_amount
+                        ) - COALESCE(
+                            (
+                                SELECT SUM(pa.amount)
+                                FROM payment_allocations pa
+                                WHERE pa.invoice_id = invoices.id
+                                  AND pa.status = 'ALLOCATED'
+                            ),
+                            0
+                        )
+                    FROM invoices
+                    WHERE id = :invoice_id
+                    """
+                ),
+                {"invoice_id": invoice_id},
+            )
+
+            assert remaining_amount == 0
+
+            credit_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM payment_credits
+                    WHERE payment_transaction_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            assert credit_count == 0
+
+            transaction_amount = await db.scalar(
+                text(
+                    """
+                    SELECT amount
+                    FROM payment_transactions
+                    WHERE id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            assert transaction_amount == payment_amount
+
+            ledger_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM ledger_entries
+                    WHERE payment_transaction_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            outbox_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM outbox_events
+                    WHERE aggregate_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            assert ledger_count == 1
+            assert outbox_count == 1
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE aggregate_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM ledger_entries
+                    WHERE payment_transaction_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_allocations
+                    WHERE payment_transaction_id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_transactions
+                    WHERE id = :transaction_id
+                    """
+                ),
+                {"transaction_id": transaction_id},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_processing
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM raw_payment_webhooks
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM invoices
+                    WHERE id = :invoice_id
+                    """
+                ),
+                {"invoice_id": invoice_id},
+            )
+
+            await db.commit()
+
+    except Exception:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE aggregate_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number = :receipt
+                    )
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM ledger_entries
+                    WHERE payment_transaction_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number = :receipt
+                    )
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_allocations
+                    WHERE payment_transaction_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number = :receipt
+                    )
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_transactions
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_processing
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM raw_payment_webhooks
+                    WHERE mpesa_receipt_number = :receipt
+                    """
+                ),
+                {"receipt": receipt},
+            )
+
+            if invoice_id:
+                await db.execute(
+                    text(
+                        """
+                        DELETE FROM invoices
+                        WHERE id = :invoice_id
+                        """
+                    ),
+                    {"invoice_id": invoice_id},
+                )
+
+            await db.commit()
+
+        raise
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_concurrent_different_payments_cannot_overallocate_same_invoice():
+    suffix = uuid4().hex[:12]
+
+    invoice_number = f"IT-CONCURRENT-INVOICE-{suffix}"
+
+    receipt_a = f"IT-CONCURRENT-A-{suffix}"
+    merchant_a = f"IT-CONCURRENT-MERCHANT-A-{suffix}"
+    checkout_a = f"IT-CONCURRENT-CHECKOUT-A-{suffix}"
+
+    receipt_b = f"IT-CONCURRENT-B-{suffix}"
+    merchant_b = f"IT-CONCURRENT-MERCHANT-B-{suffix}"
+    checkout_b = f"IT-CONCURRENT-CHECKOUT-B-{suffix}"
+
+    invoice_amount = 100
+    payment_amount = 70
+    expected_total_payment = 140
+    expected_allocation = 100
+    expected_credit = 40
+
+    invoice_id = None
+    transaction_ids = []
+
+    async with TestSystemSessionLocal() as db:
+        result = await db.execute(
+            text(
+                """
+                INSERT INTO invoices (
+                    landlord_id,
+                    unit_id,
+                    tenant_id,
+                    invoice_number,
+                    billing_month,
+                    rent_amount,
+                    water_amount,
+                    garbage_amount,
+                    security_amount,
+                    due_date,
+                    is_paid
+                )
+                VALUES (
+                    :landlord_id,
+                    :unit_id,
+                    :tenant_id,
+                    :invoice_number,
+                    CURRENT_DATE,
+                    :rent_amount,
+                    0,
+                    0,
+                    0,
+                    CURRENT_DATE,
+                    false
+                )
+                RETURNING id
+                """
+            ),
+            {
+                "landlord_id": LANDLORD_ID,
+                "unit_id": UNIT_ID,
+                "tenant_id": TENANT_ID,
+                "invoice_number": invoice_number,
+                "rent_amount": invoice_amount,
+            },
+        )
+
+        invoice_id = str(result.scalar_one())
+        await db.commit()
+
+    payload_a = callback_payload(
+        receipt_a,
+        merchant_a,
+        checkout_a,
+        payment_amount,
+    )
+
+    payload_b = callback_payload(
+        receipt_b,
+        merchant_b,
+        checkout_b,
+        payment_amount,
+    )
+    await _record_stk_request(merchant_a, checkout_a)
+    await _record_stk_request(merchant_b, checkout_b)
+
+    async def send_payment(payload):
+        async with _webhook_client() as client:
+            return await client.post(
+                WEBHOOK_URL,
+                json=payload,
+            )
+
+    try:
+        response_a, response_b = await asyncio.gather(
+            send_payment(payload_a),
+            send_payment(payload_b),
+        )
+
+        assert response_a.status_code == 200
+        assert response_b.status_code == 200
+
+        body_a = response_a.json()
+        body_b = response_b.json()
+
+        assert body_a["ResultCode"] == 0
+        assert body_b["ResultCode"] == 0
+
+        assert body_a["reconciliation"]["status"] == "MATCHED"
+        assert body_b["reconciliation"]["status"] == "MATCHED"
+
+        transaction_id_a = body_a["reconciliation"]["payment_transaction_id"]
+        transaction_id_b = body_b["reconciliation"]["payment_transaction_id"]
+
+        transaction_ids = [transaction_id_a, transaction_id_b]
+
+        assert transaction_id_a != transaction_id_b
+
+        async with TestSystemSessionLocal() as db:
+            allocation_total = await db.scalar(
+                text(
+                    """
+                    SELECT COALESCE(SUM(amount), 0)
+                    FROM payment_allocations
+                    WHERE invoice_id = :invoice_id
+                      AND status = 'ALLOCATED'
+                    """
+                ),
+                {"invoice_id": invoice_id},
+            )
+
+            assert allocation_total == expected_allocation
+            assert allocation_total <= invoice_amount
+
+            credit_total = await db.scalar(
+                text(
+                    """
+                    SELECT COALESCE(SUM(amount), 0)
+                    FROM payment_credits
+                    WHERE payment_transaction_id IN (:transaction_id_a, :transaction_id_b)
+                    """
+                ),
+                {
+                    "transaction_id_a": transaction_id_a,
+                    "transaction_id_b": transaction_id_b,
+                },
+            )
+
+            assert credit_total == expected_credit
+
+            transaction_total = await db.scalar(
+                text(
+                    """
+                    SELECT COALESCE(SUM(amount), 0)
+                    FROM payment_transactions
+                    WHERE id IN (:transaction_id_a, :transaction_id_b)
+                    """
+                ),
+                {
+                    "transaction_id_a": transaction_id_a,
+                    "transaction_id_b": transaction_id_b,
+                },
+            )
+
+            assert transaction_total == expected_total_payment
+
+            invoice_paid = await db.scalar(
+                text(
+                    """
+                    SELECT is_paid
+                    FROM invoices
+                    WHERE id = :invoice_id
+                    """
+                ),
+                {"invoice_id": invoice_id},
+            )
+
+            assert invoice_paid is True
+
+            ledger_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM ledger_entries
+                    WHERE payment_transaction_id IN (
+                        :transaction_id_a,
+                        :transaction_id_b
+                    )
+                    """
+                ),
+                {
+                    "transaction_id_a": transaction_id_a,
+                    "transaction_id_b": transaction_id_b,
+                },
+            )
+
+            outbox_count = await db.scalar(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM outbox_events
+                    WHERE aggregate_id IN (
+                        :transaction_id_a,
+                        :transaction_id_b
+                    )
+                    """
+                ),
+                {
+                    "transaction_id_a": transaction_id_a,
+                    "transaction_id_b": transaction_id_b,
+                },
+            )
+
+            assert ledger_count == 2
+            assert outbox_count == 2
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE aggregate_id IN (
+                        :transaction_id_a,
+                        :transaction_id_b
+                    )
+                    """
+                ),
+                {
+                    "transaction_id_a": transaction_id_a,
+                    "transaction_id_b": transaction_id_b,
+                },
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM ledger_entries
+                    WHERE payment_transaction_id IN (
+                        :transaction_id_a,
+                        :transaction_id_b
+                    )
+                    """
+                ),
+                {
+                    "transaction_id_a": transaction_id_a,
+                    "transaction_id_b": transaction_id_b,
+                },
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_credits
+                    WHERE payment_transaction_id IN (
+                        :transaction_id_a,
+                        :transaction_id_b
+                    )
+                    """
+                ),
+                {
+                    "transaction_id_a": transaction_id_a,
+                    "transaction_id_b": transaction_id_b,
+                },
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_allocations
+                    WHERE payment_transaction_id IN (
+                        :transaction_id_a,
+                        :transaction_id_b
+                    )
+                    """
+                ),
+                {
+                    "transaction_id_a": transaction_id_a,
+                    "transaction_id_b": transaction_id_b,
+                },
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_transactions
+                    WHERE id IN (
+                        :transaction_id_a,
+                        :transaction_id_b
+                    )
+                    """
+                ),
+                {
+                    "transaction_id_a": transaction_id_a,
+                    "transaction_id_b": transaction_id_b,
+                },
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_processing
+                    WHERE mpesa_receipt_number IN (
+                        :receipt_a,
+                        :receipt_b
+                    )
+                    """
+                ),
+                {
+                    "receipt_a": receipt_a,
+                    "receipt_b": receipt_b,
+                },
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM raw_payment_webhooks
+                    WHERE mpesa_receipt_number IN (
+                        :receipt_a,
+                        :receipt_b
+                    )
+                    """
+                ),
+                {
+                    "receipt_a": receipt_a,
+                    "receipt_b": receipt_b,
+                },
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM invoices
+                    WHERE id = :invoice_id
+                    """
+                ),
+                {"invoice_id": invoice_id},
+            )
+
+            await db.commit()
+
+    except Exception:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE aggregate_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number IN (
+                            :receipt_a,
+                            :receipt_b
+                        )
+                    )
+                    """
+                ),
+                {
+                    "receipt_a": receipt_a,
+                    "receipt_b": receipt_b,
+                },
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM ledger_entries
+                    WHERE payment_transaction_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number IN (
+                            :receipt_a,
+                            :receipt_b
+                        )
+                    )
+                    """
+                ),
+                {
+                    "receipt_a": receipt_a,
+                    "receipt_b": receipt_b,
+                },
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_credits
+                    WHERE payment_transaction_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number IN (
+                            :receipt_a,
+                            :receipt_b
+                        )
+                    )
+                    """
+                ),
+                {
+                    "receipt_a": receipt_a,
+                    "receipt_b": receipt_b,
+                },
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_allocations
+                    WHERE payment_transaction_id IN (
+                        SELECT id
+                        FROM payment_transactions
+                        WHERE mpesa_receipt_number IN (
+                            :receipt_a,
+                            :receipt_b
+                        )
+                    )
+                    """
+                ),
+                {
+                    "receipt_a": receipt_a,
+                    "receipt_b": receipt_b,
+                },
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_transactions
+                    WHERE mpesa_receipt_number IN (
+                        :receipt_a,
+                        :receipt_b
+                    )
+                    """
+                ),
+                {
+                    "receipt_a": receipt_a,
+                    "receipt_b": receipt_b,
+                },
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM payment_processing
+                    WHERE mpesa_receipt_number IN (
+                        :receipt_a,
+                        :receipt_b
+                    )
+                    """
+                ),
+                {
+                    "receipt_a": receipt_a,
+                    "receipt_b": receipt_b,
+                },
+            )
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM raw_payment_webhooks
+                    WHERE mpesa_receipt_number IN (
+                        :receipt_a,
+                        :receipt_b
+                    )
+                    """
+                ),
+                {
+                    "receipt_a": receipt_a,
+                    "receipt_b": receipt_b,
+                },
+            )
+
+            if invoice_id:
+                await db.execute(
+                    text(
+                        """
+                        DELETE FROM invoices
+                        WHERE id = :invoice_id
+                        """
+                    ),
+                    {"invoice_id": invoice_id},
+                )
+
+            await db.commit()
+
+        raise
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_outbox_claim_pending_locks_and_returns_event():
+    event_id = None
+    idempotency_key = f"IT-OUTBOX-CLAIM-{uuid4().hex}"
+
+    async with TestSystemSessionLocal() as db:
+        result = await db.execute(
+            text(
+                """
+                INSERT INTO outbox_events (
+                    event_type,
+                    aggregate_type,
+                    aggregate_id,
+                    idempotency_key,
+                    payload,
+                    status,
+                    available_at
+                )
+                VALUES (
+                    'TEST_EVENT',
+                    'TEST_AGGREGATE',
+                    gen_random_uuid(),
+                    :idempotency_key,
+                    '{"test": true}'::jsonb,
+                    'PENDING',
+                    CURRENT_TIMESTAMP
+                )
+                RETURNING id
+                """
+            ),
+            {"idempotency_key": idempotency_key},
+        )
+
+        event_id = result.scalar_one()
+        await db.commit()
+
+    try:
+        async with TestSystemSessionLocal() as db:
+            repository = OutboxEventRepository(db)
+
+            claimed = None
+            while claimed is None:
+                events = await repository.claim_pending(limit=10)
+                claimed = next(
+                    (
+                        event
+                        for event in events
+                        if event["id"] == event_id
+                    ),
+                    None,
+                )
+
+                if claimed is None and len(events) < 10:
+                    break
+
+            assert claimed is not None
+            assert claimed["status"] == "PENDING"
+            assert claimed["locked_at"] is not None
+
+            await db.rollback()
+
+    finally:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE id = :event_id
+                    """
+                ),
+                {"event_id": event_id},
+            )
+            await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_outbox_schedule_retry_updates_attempts_and_available_at():
+    event_id = None
+    idempotency_key = f"IT-OUTBOX-RETRY-{uuid4().hex}"
+
+    async with TestSystemSessionLocal() as db:
+        result = await db.execute(
+            text(
+                """
+                INSERT INTO outbox_events (
+                    event_type,
+                    aggregate_type,
+                    aggregate_id,
+                    idempotency_key,
+                    payload,
+                    status,
+                    attempts,
+                    available_at,
+                    locked_at
+                )
+                VALUES (
+                    'TEST_EVENT',
+                    'TEST_AGGREGATE',
+                    gen_random_uuid(),
+                    :idempotency_key,
+                    '{"test": true}'::jsonb,
+                    'PENDING',
+                    0,
+                    CURRENT_TIMESTAMP,
+                    CURRENT_TIMESTAMP
+                )
+                RETURNING id
+                """
+            ),
+            {"idempotency_key": idempotency_key},
+        )
+
+        event_id = result.scalar_one()
+        await db.commit()
+
+    try:
+        async with TestSystemSessionLocal() as db:
+            repository = OutboxEventRepository(db)
+
+            before = await db.scalar(
+                text(
+                    """
+                    SELECT available_at
+                    FROM outbox_events
+                    WHERE id = :event_id
+                    """
+                ),
+                {"event_id": event_id},
+            )
+
+            await repository.schedule_retry(
+                event_id=event_id,
+                error="simulated publisher failure",
+                delay_seconds=60,
+            )
+
+            await db.commit()
+
+            row = (
+                await db.execute(
+                    text(
+                        """
+                        SELECT
+                            status,
+                            attempts,
+                            available_at,
+                            last_error,
+                            locked_at
+                        FROM outbox_events
+                        WHERE id = :event_id
+                        """
+                    ),
+                    {"event_id": event_id},
+                )
+            ).mappings().first()
+
+            assert row is not None
+            assert row["status"] == "PENDING"
+            assert row["attempts"] == 1
+            assert row["last_error"] == "simulated publisher failure"
+            assert row["locked_at"] is None
+            assert row["available_at"] > before
+
+    finally:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE id = :event_id
+                    """
+                ),
+                {"event_id": event_id},
+            )
+            await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_outbox_mark_published_sets_published_state():
+    event_id = None
+    idempotency_key = f"IT-OUTBOX-PUBLISHED-{uuid4().hex}"
+
+    async with TestSystemSessionLocal() as db:
+        result = await db.execute(
+            text(
+                """
+                INSERT INTO outbox_events (
+                    event_type,
+                    aggregate_type,
+                    aggregate_id,
+                    idempotency_key,
+                    payload,
+                    status,
+                    locked_at
+                )
+                VALUES (
+                    'TEST_EVENT',
+                    'TEST_AGGREGATE',
+                    gen_random_uuid(),
+                    :idempotency_key,
+                    '{"test": true}'::jsonb,
+                    'PENDING',
+                    CURRENT_TIMESTAMP
+                )
+                RETURNING id
+                """
+            ),
+            {"idempotency_key": idempotency_key},
+        )
+
+        event_id = result.scalar_one()
+        await db.commit()
+
+    try:
+        async with TestSystemSessionLocal() as db:
+            repository = OutboxEventRepository(db)
+
+            await repository.mark_published(
+                event_id=event_id,
+            )
+
+            await db.commit()
+
+            row = (
+                await db.execute(
+                    text(
+                        """
+                        SELECT
+                            status,
+                            published_at,
+                            last_error,
+                            locked_at
+                        FROM outbox_events
+                        WHERE id = :event_id
+                        """
+                    ),
+                    {"event_id": event_id},
+                )
+            ).mappings().first()
+
+            assert row is not None
+            assert row["status"] == "PUBLISHED"
+            assert row["published_at"] is not None
+            assert row["last_error"] is None
+            assert row["locked_at"] is None
+
+    finally:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE id = :event_id
+                    """
+                ),
+                {"event_id": event_id},
+            )
+            await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_outbox_claim_pending_prevents_two_workers_claiming_same_event():
+    event_id = None
+    idempotency_key = f"IT-OUTBOX-CONCURRENT-CLAIM-{uuid4().hex}"
+
+    async with TestSystemSessionLocal() as db:
+        result = await db.execute(
+            text(
+                """
+                INSERT INTO outbox_events (
+                    event_type,
+                    aggregate_type,
+                    aggregate_id,
+                    idempotency_key,
+                    payload,
+                    status,
+                    available_at
+                )
+                VALUES (
+                    'TEST_EVENT',
+                    'TEST_AGGREGATE',
+                    gen_random_uuid(),
+                    :idempotency_key,
+                    '{"test": true}'::jsonb,
+                    'PENDING',
+                    CURRENT_TIMESTAMP
+                )
+                RETURNING id
+                """
+            ),
+            {"idempotency_key": idempotency_key},
+        )
+
+        event_id = result.scalar_one()
+        await db.commit()
+
+    db_a = TestSystemSessionLocal()
+    db_b = TestSystemSessionLocal()
+
+    try:
+        repository_a = OutboxEventRepository(db_a)
+        repository_b = OutboxEventRepository(db_b)
+
+        claimed_a, claimed_b = await asyncio.gather(
+            repository_a.claim_pending(limit=100),
+            repository_b.claim_pending(limit=100),
+        )
+
+        events_a = [
+            event
+            for event in claimed_a
+            if event["id"] == event_id
+        ]
+
+        events_b = [
+            event
+            for event in claimed_b
+            if event["id"] == event_id
+        ]
+
+        assert len(events_a) + len(events_b) == 1
+
+        await db_a.commit()
+        await db_b.commit()
+
+    finally:
+        await db_a.close()
+        await db_b.close()
+
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE id = :event_id
+                    """
+                ),
+                {"event_id": event_id},
+            )
+            await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_outbox_worker_publishes_pending_event():
+    event_id = None
+    idempotency_key = f"IT-OUTBOX-WORKER-SUCCESS-{uuid4().hex}"
+
+    async with TestSystemSessionLocal() as db:
+        result = await db.execute(
+            text(
+                """
+                INSERT INTO outbox_events (
+                    event_type,
+                    aggregate_type,
+                    aggregate_id,
+                    idempotency_key,
+                    payload,
+                    status,
+                    available_at
+                )
+                VALUES (
+                    'TEST_EVENT',
+                    'TEST_AGGREGATE',
+                    gen_random_uuid(),
+                    :idempotency_key,
+                    '{"test": true}'::jsonb,
+                    'PENDING',
+                    CURRENT_TIMESTAMP
+                )
+                RETURNING id
+                """
+            ),
+            {"idempotency_key": idempotency_key},
+        )
+
+        event_id = result.scalar_one()
+        await db.commit()
+
+    try:
+        publisher = TestEventPublisher()
+
+        worker = OutboxWorker(
+            TestSystemSessionLocal,
+            publisher,
+            batch_size=100,
+        )
+
+        processed = await worker.run_once()
+
+        assert processed >= 1
+
+        published_event = next(
+            (
+                event
+                for event in publisher.published_events
+                if event["id"] == event_id
+            ),
+            None,
+        )
+
+        assert published_event is not None
+
+        async with TestSystemSessionLocal() as db:
+            row = (
+                await db.execute(
+                    text(
+                        """
+                        SELECT
+                            status,
+                            published_at,
+                            attempts,
+                            last_error,
+                            locked_at
+                        FROM outbox_events
+                        WHERE id = :event_id
+                        """
+                    ),
+                    {"event_id": event_id},
+                )
+            ).mappings().first()
+
+            assert row is not None
+            assert row["status"] == "PUBLISHED"
+            assert row["published_at"] is not None
+            assert row["attempts"] == 0
+            assert row["last_error"] is None
+            assert row["locked_at"] is None
+
+    finally:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE id = :event_id
+                    """
+                ),
+                {"event_id": event_id},
+            )
+            await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_outbox_worker_schedules_retry_after_publish_failure():
+    event_id = None
+    idempotency_key = f"IT-OUTBOX-WORKER-RETRY-{uuid4().hex}"
+
+    async with TestSystemSessionLocal() as db:
+        result = await db.execute(
+            text(
+                """
+                INSERT INTO outbox_events (
+                    event_type,
+                    aggregate_type,
+                    aggregate_id,
+                    idempotency_key,
+                    payload,
+                    status,
+                    available_at
+                )
+                VALUES (
+                    'TEST_EVENT',
+                    'TEST_AGGREGATE',
+                    gen_random_uuid(),
+                    :idempotency_key,
+                    '{"test": true}'::jsonb,
+                    'PENDING',
+                    CURRENT_TIMESTAMP
+                )
+                RETURNING id
+                """
+            ),
+            {"idempotency_key": idempotency_key},
+        )
+
+        event_id = result.scalar_one()
+        before = await db.scalar(
+            text(
+                """
+                SELECT available_at
+                FROM outbox_events
+                WHERE id = :event_id
+                """
+            ),
+            {"event_id": event_id},
+        )
+        await db.commit()
+
+    try:
+        publisher = TestEventPublisher()
+        publisher.fail = True
+
+        worker = OutboxWorker(
+            TestSystemSessionLocal,
+            publisher,
+            batch_size=100,
+        )
+
+        processed = await worker.run_once()
+
+        assert processed == 0
+
+        async with TestSystemSessionLocal() as db:
+            row = (
+                await db.execute(
+                    text(
+                        """
+                        SELECT
+                            status,
+                            attempts,
+                            available_at,
+                            last_error,
+                            locked_at
+                        FROM outbox_events
+                        WHERE id = :event_id
+                        """
+                    ),
+                    {"event_id": event_id},
+                )
+            ).mappings().first()
+
+            assert row is not None
+            assert row["status"] == "PENDING"
+            assert row["attempts"] == 1
+            assert row["available_at"] > before
+            assert row["last_error"] == "Simulated publisher failure"
+            assert row["locked_at"] is None
+
+    finally:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE id = :event_id
+                    """
+                ),
+                {"event_id": event_id},
+            )
+            await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_outbox_worker_marks_event_failed_after_max_attempts():
+    event_id = None
+    idempotency_key = f"IT-OUTBOX-WORKER-FAILED-{uuid4().hex}"
+
+    async with TestSystemSessionLocal() as db:
+        result = await db.execute(
+            text(
+                """
+                INSERT INTO outbox_events (
+                    event_type,
+                    aggregate_type,
+                    aggregate_id,
+                    idempotency_key,
+                    payload,
+                    status,
+                    attempts,
+                    available_at
+                )
+                VALUES (
+                    'TEST_EVENT',
+                    'TEST_AGGREGATE',
+                    gen_random_uuid(),
+                    :idempotency_key,
+                    '{"test": true}'::jsonb,
+                    'PENDING',
+                    1,
+                    CURRENT_TIMESTAMP
+                )
+                RETURNING id
+                """
+            ),
+            {"idempotency_key": idempotency_key},
+        )
+
+        event_id = result.scalar_one()
+        await db.commit()
+
+    try:
+        publisher = TestEventPublisher()
+        publisher.fail = True
+
+        worker = OutboxWorker(
+            TestSystemSessionLocal,
+            publisher,
+            batch_size=100,
+            max_attempts=2,
+        )
+
+        first_result = await worker.run_once()
+
+        assert first_result == 0
+
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    UPDATE outbox_events
+                    SET available_at = CURRENT_TIMESTAMP
+                    WHERE id = :event_id
+                    """
+                ),
+                {"event_id": event_id},
+            )
+            await db.commit()
+
+        second_result = await worker.run_once()
+
+        assert second_result == 0
+
+        async with TestSystemSessionLocal() as db:
+            row = (
+                await db.execute(
+                    text(
+                        """
+                        SELECT
+                            status,
+                            attempts,
+                            last_error,
+                            locked_at
+                        FROM outbox_events
+                        WHERE id = :event_id
+                        """
+                    ),
+                    {"event_id": event_id},
+                )
+            ).mappings().first()
+
+            assert row is not None
+            assert row["status"] == "FAILED"
+            assert row["attempts"] == 2
+            assert row["last_error"] == "Simulated publisher failure"
+            assert row["locked_at"] is None
+
+    finally:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE id = :event_id
+                    """
+                ),
+                {"event_id": event_id},
+            )
+            await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_outbox_worker_reclaims_stale_locked_event():
+    event_id = None
+    idempotency_key = f"IT-OUTBOX-STALE-LOCK-{uuid4().hex}"
+
+    async with TestSystemSessionLocal() as db:
+        result = await db.execute(
+            text(
+                """
+                INSERT INTO outbox_events (
+                    event_type,
+                    aggregate_type,
+                    aggregate_id,
+                    idempotency_key,
+                    payload,
+                    status,
+                    attempts,
+                    available_at,
+                    locked_at
+                )
+                VALUES (
+                    'TEST_EVENT',
+                    'TEST_AGGREGATE',
+                    gen_random_uuid(),
+                    :idempotency_key,
+                    '{"test": true}'::jsonb,
+                    'PENDING',
+                    0,
+                    CURRENT_TIMESTAMP,
+                    CURRENT_TIMESTAMP - INTERVAL '10 minutes'
+                )
+                RETURNING id
+                """
+            ),
+            {"idempotency_key": idempotency_key},
+        )
+
+        event_id = result.scalar_one()
+        await db.commit()
+
+    try:
+        publisher = TestEventPublisher()
+
+        worker = OutboxWorker(
+            TestSystemSessionLocal,
+            publisher,
+            batch_size=100,
+            max_attempts=5,
+        )
+
+        processed = await worker.run_once()
+
+        assert processed >= 1
+
+        published_event = next(
+            (
+                event
+                for event in publisher.published_events
+                if event["id"] == event_id
+            ),
+            None,
+        )
+
+        assert published_event is not None
+
+        async with TestSystemSessionLocal() as db:
+            row = (
+                await db.execute(
+                    text(
+                        """
+                        SELECT
+                            status,
+                            attempts,
+                            published_at,
+                            locked_at
+                        FROM outbox_events
+                        WHERE id = :event_id
+                        """
+                    ),
+                    {"event_id": event_id},
+                )
+            ).mappings().first()
+
+            assert row is not None
+            assert row["status"] == "PUBLISHED"
+            assert row["attempts"] == 0
+            assert row["published_at"] is not None
+            assert row["locked_at"] is None
+
+    finally:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM outbox_events
+                    WHERE id = :event_id
+                    """
+                ),
+                {"event_id": event_id},
+            )
+            await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_outbox_claim_respects_batch_limit_and_deterministic_order():
+    idempotency_keys = [
+        f"IT-OUTBOX-BATCH-LIMIT-{uuid4().hex}" for _ in range(3)
+    ]
+    event_ids = []
+
+    try:
+        async with TestSystemSessionLocal() as db:
+            for idempotency_key in idempotency_keys:
+                event_id = await db.scalar(
+                    text(
+                        """
+                        INSERT INTO outbox_events (
+                            event_type, aggregate_type, aggregate_id,
+                            idempotency_key, payload, status, available_at,
+                            created_at
+                        )
+                        VALUES (
+                            'TEST_EVENT', 'TEST_AGGREGATE', gen_random_uuid(),
+                            :idempotency_key, '{"test": true}'::jsonb,
+                            'PENDING', CURRENT_TIMESTAMP - INTERVAL '1 day',
+                            CURRENT_TIMESTAMP - INTERVAL '100 days'
+                        )
+                        RETURNING id
+                        """
+                    ),
+                    {"idempotency_key": idempotency_key},
+                )
+                event_ids.append(event_id)
+            await db.commit()
+
+        async with TestSystemSessionLocal() as db:
+            claimed = await OutboxEventRepository(db).claim_pending(
+                limit=2,
+                lock_timeout_seconds=settings.OUTBOX_LOCK_TIMEOUT_SECONDS,
+            )
+            claimed_target_ids = [
+                event["id"] for event in claimed if event["id"] in event_ids
+            ]
+            assert len(claimed) <= 2
+            assert len(claimed_target_ids) == 2
+            assert claimed_target_ids == sorted(event_ids)[:2]
+            await db.commit()
+    finally:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text("DELETE FROM outbox_events WHERE id = ANY(:event_ids)"),
+                {"event_ids": event_ids},
+            )
+            await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_outbox_worker_records_partial_batch_results_independently():
+    idempotency_keys = [
+        f"IT-OUTBOX-PARTIAL-BATCH-{uuid4().hex}" for _ in range(3)
+    ]
+    event_ids = []
+
+    try:
+        async with TestSystemSessionLocal() as db:
+            for idempotency_key in idempotency_keys:
+                event_id = await db.scalar(
+                    text(
+                        """
+                        INSERT INTO outbox_events (
+                            event_type, aggregate_type, aggregate_id,
+                            idempotency_key, payload, status, available_at,
+                            created_at
+                        )
+                        VALUES (
+                            'TEST_EVENT', 'TEST_AGGREGATE', gen_random_uuid(),
+                            :idempotency_key, '{"test": true}'::jsonb,
+                            'PENDING', CURRENT_TIMESTAMP,
+                            CURRENT_TIMESTAMP - INTERVAL '100 days'
+                        )
+                        RETURNING id
+                        """
+                    ),
+                    {"idempotency_key": idempotency_key},
+                )
+                event_ids.append(event_id)
+            await db.commit()
+
+        publisher = TestEventPublisher()
+        original_publish = publisher.publish
+
+        async def fail_one_event(event):
+            if event["idempotency_key"] == idempotency_keys[1]:
+                raise RuntimeError("simulated single-event failure")
+            await original_publish(event)
+
+        publisher.publish = fail_one_event
+        worker = OutboxWorker(
+            TestSystemSessionLocal,
+            publisher,
+            batch_size=3,
+            lock_timeout_seconds=settings.OUTBOX_LOCK_TIMEOUT_SECONDS,
+        )
+
+        processed = await worker.run_once()
+
+        assert processed == 2
+        assert len(publisher.published_events) == 2
+        assert all(
+            "_stale_lock_reclaimed" not in event
+            for event in publisher.published_events
+        )
+        async with TestSystemSessionLocal() as db:
+            rows = {}
+            for event_id in event_ids:
+                rows[event_id] = (
+                    await db.execute(
+                        text(
+                            """
+                            SELECT status, attempts, locked_at, idempotency_key
+                            FROM outbox_events WHERE id = :event_id
+                            """
+                        ),
+                        {"event_id": event_id},
+                    )
+                ).mappings().one()
+
+            for index, event_id in enumerate(event_ids):
+                if index == 1:
+                    assert rows[event_id]["status"] == "PENDING"
+                    assert rows[event_id]["attempts"] == 1
+                else:
+                    assert rows[event_id]["status"] == "PUBLISHED"
+                    assert rows[event_id]["attempts"] == 0
+                assert rows[event_id]["locked_at"] is None
+                assert rows[event_id]["idempotency_key"] == idempotency_keys[index]
+    finally:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text("DELETE FROM outbox_events WHERE id = ANY(:event_ids)"),
+                {"event_ids": event_ids},
+            )
+            await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_outbox_worker_recovers_crash_after_publish_before_state_update():
+    idempotency_key = f"IT-OUTBOX-CRASH-RESTART-{uuid4().hex}"
+    event_id = None
+
+    try:
+        async with TestSystemSessionLocal() as db:
+            event_id = await db.scalar(
+                text(
+                    """
+                    INSERT INTO outbox_events (
+                        event_type, aggregate_type, aggregate_id,
+                        idempotency_key, payload, status, available_at,
+                        created_at
+                    )
+                    VALUES (
+                        'TEST_EVENT', 'TEST_AGGREGATE', gen_random_uuid(),
+                        :idempotency_key, '{"test": true}'::jsonb,
+                        'PENDING', CURRENT_TIMESTAMP,
+                        CURRENT_TIMESTAMP - INTERVAL '200 days'
+                    )
+                    RETURNING id
+                    """
+                ),
+                {"idempotency_key": idempotency_key},
+            )
+            await db.commit()
+
+        # Simulate a worker claiming and publishing the row, then crashing
+        # before it records the Kafka acknowledgement in PostgreSQL.
+        async with TestSystemSessionLocal() as db:
+            claimed = await OutboxEventRepository(db).claim_pending(limit=1)
+            claimed_event = next(
+                (event for event in claimed if event["id"] == event_id),
+                None,
+            )
+            assert claimed_event is not None
+            await db.commit()
+
+        first_delivery = TestEventPublisher()
+        await first_delivery.publish(
+            {
+                key: value
+                for key, value in claimed_event.items()
+                if not key.startswith("_")
+            }
+        )
+
+        async with TestSystemSessionLocal() as db:
+            await db.execute(
+                text(
+                    """
+                    UPDATE outbox_events
+                    SET locked_at = CURRENT_TIMESTAMP
+                        - make_interval(secs => :stale_seconds)
+                    WHERE id = :event_id
+                    """
+                ),
+                {
+                    "event_id": event_id,
+                    "stale_seconds": settings.OUTBOX_LOCK_TIMEOUT_SECONDS + 1,
+                },
+            )
+            await db.commit()
+
+        restarted_publisher = TestEventPublisher()
+        worker = OutboxWorker(
+            TestSystemSessionLocal,
+            restarted_publisher,
+            batch_size=1,
+            lock_timeout_seconds=settings.OUTBOX_LOCK_TIMEOUT_SECONDS,
+        )
+        assert await worker.run_once() == 1
+
+        assert first_delivery.published_events[0]["id"] == event_id
+        redelivered = restarted_publisher.published_events[0]
+        assert redelivered["id"] == event_id
+        assert redelivered["idempotency_key"] == idempotency_key
+
+        async with TestSystemSessionLocal() as db:
+            row = (
+                await db.execute(
+                    text(
+                        """
+                        SELECT status, attempts, locked_at
+                        FROM outbox_events WHERE id = :event_id
+                        """
+                    ),
+                    {"event_id": event_id},
+                )
+            ).mappings().one()
+            assert row["status"] == "PUBLISHED"
+            assert row["attempts"] == 0
+            assert row["locked_at"] is None
+    finally:
+        if event_id is not None:
+            async with TestSystemSessionLocal() as db:
+                await db.execute(
+                    text("DELETE FROM outbox_events WHERE id = :event_id"),
+                    {"event_id": event_id},
+                )
+                await db.commit()
+
+
+def _direct_allocation_service(db: AsyncSession) -> InvoiceAllocationService:
+    return InvoiceAllocationService(
+        invoice_repository=InvoiceRepository(db),
+        payment_allocation_repository=PaymentAllocationRepository(db),
+        payment_credit_repository=PaymentCreditRepository(db),
+        payment_transaction_repository=PaymentTransactionRepository(db),
+    )
+
+
+async def _create_direct_allocation_fixture(
+    *,
+    suffix: str,
+    payment_amount: Decimal,
+    invoice_amounts: list[Decimal],
+) -> tuple[str, list[str]]:
+    async with TestSystemSessionLocal() as db:
+        transaction_result = await db.execute(
+            text(
+                """
+                INSERT INTO payment_transactions (
+                    landlord_id, tenant_id, mpesa_receipt_number,
+                    amount, payment_method, status, completed_at
+                )
+                VALUES (
+                    :landlord_id, :tenant_id, :receipt,
+                    :amount, 'MPESA_STK_PUSH', 'COMPLETED', CURRENT_TIMESTAMP
+                )
+                RETURNING id
+                """
+            ),
+            {
+                "landlord_id": LANDLORD_ID,
+                "tenant_id": TENANT_ID,
+                "receipt": f"IT-ALLOC-DIRECT-{suffix}",
+                "amount": payment_amount,
+            },
+        )
+        payment_transaction_id = str(transaction_result.scalar_one())
+
+        invoice_ids: list[str] = []
+        for index, invoice_amount in enumerate(invoice_amounts):
+            invoice_result = await db.execute(
+                text(
+                    """
+                    INSERT INTO invoices (
+                        landlord_id, unit_id, tenant_id, invoice_number,
+                        billing_month, rent_amount, water_amount,
+                        garbage_amount, security_amount, due_date, is_paid
+                    )
+                    VALUES (
+                        :landlord_id, :unit_id, :tenant_id, :invoice_number,
+                        :billing_month, :rent_amount, 0, 0, 0, :due_date, FALSE
+                    )
+                    RETURNING id
+                    """
+                ),
+                {
+                    "landlord_id": LANDLORD_ID,
+                    "unit_id": UNIT_ID,
+                    "tenant_id": TENANT_ID,
+                    "invoice_number": f"IT-ALLOC-DIRECT-{suffix}-{index}",
+                    "billing_month": date(2026, index + 1, 1),
+                    "rent_amount": invoice_amount,
+                    "due_date": date(2026, index + 1, 15),
+                },
+            )
+            invoice_ids.append(str(invoice_result.scalar_one()))
+
+        await db.commit()
+        return payment_transaction_id, invoice_ids
+
+
+async def _delete_direct_allocation_fixture(
+    *,
+    payment_transaction_id: str,
+    invoice_ids: list[str],
+) -> None:
+    async with TestSystemSessionLocal() as db:
+        await db.execute(
+            text("""
+                DELETE FROM payment_credit_applications
+                WHERE payment_credit_id IN (
+                    SELECT id FROM payment_credits WHERE payment_transaction_id = :id
+                ) OR invoice_id = ANY(CAST(:invoice_ids AS uuid[]))
+            """),
+            {"id": payment_transaction_id, "invoice_ids": invoice_ids},
+        )
+        await db.execute(
+            text("DELETE FROM payment_credits WHERE payment_transaction_id = :id"),
+            {"id": payment_transaction_id},
+        )
+        await db.execute(
+            text("DELETE FROM payment_allocations WHERE payment_transaction_id = :id"),
+            {"id": payment_transaction_id},
+        )
+        await db.execute(
+            text("DELETE FROM payment_transactions WHERE id = :id"),
+            {"id": payment_transaction_id},
+        )
+        for invoice_id in invoice_ids:
+            await db.execute(
+                text("DELETE FROM invoices WHERE id = :id"),
+                {"id": invoice_id},
+            )
+        await db.commit()
+
+
+async def _wait_for_postgres_blocker(
+    *,
+    waiting_pid: int,
+    blocker_pid: int,
+) -> None:
+    async with TestSystemSessionLocal() as monitor:
+        for _ in range(1000):
+            blocking_pids = await monitor.scalar(
+                text(
+                    """
+                    SELECT pg_blocking_pids(:waiting_pid)
+                    """
+                ),
+                {"waiting_pid": waiting_pid},
+            )
+            if blocker_pid in blocking_pids:
+                return
+            await asyncio.sleep(0.01)
+    raise AssertionError(
+        "Second allocator transaction was not blocked by the first payment-row lock."
+    )
+
+
+async def _run_same_payment_concurrently(
+    *,
+    payment_transaction_id: str,
+    requested_amount: Decimal,
+) -> tuple[dict, dict]:
+    first_has_allocated = asyncio.Event()
+    second_has_backend_pid = asyncio.Event()
+    allow_first_to_commit = asyncio.Event()
+    backend_pids: dict[str, int] = {}
+
+    async def first_request() -> dict:
+        async with TestSystemSessionLocal() as db:
+            async with db.begin():
+                backend_pids["first"] = await db.scalar(
+                    text("SELECT pg_backend_pid()")
+                )
+                # Hold the persisted payment row while the first allocation is
+                # written so the second independent connection must wait.
+                await db.execute(
+                    text(
+                        "SELECT id FROM payment_transactions "
+                        "WHERE id = :id FOR UPDATE"
+                    ),
+                    {"id": payment_transaction_id},
+                )
+                result = await _direct_allocation_service(db).allocate_payment(
+                    payment_transaction_id=payment_transaction_id,
+                    tenant_id=TENANT_ID,
+                    payment_amount=requested_amount,
+                )
+                first_has_allocated.set()
+                await allow_first_to_commit.wait()
+                return result
+
+    async def second_request() -> dict:
+        async with TestSystemSessionLocal() as db:
+            async with db.begin():
+                backend_pids["second"] = await db.scalar(
+                    text("SELECT pg_backend_pid()")
+                )
+                second_has_backend_pid.set()
+                return await _direct_allocation_service(db).allocate_payment(
+                    payment_transaction_id=payment_transaction_id,
+                    tenant_id=TENANT_ID,
+                    payment_amount=requested_amount,
+                )
+
+    first_task = asyncio.create_task(first_request())
+    second_task = None
+    try:
+        await asyncio.wait_for(first_has_allocated.wait(), timeout=10)
+        second_task = asyncio.create_task(second_request())
+        await asyncio.wait_for(second_has_backend_pid.wait(), timeout=10)
+        await asyncio.wait_for(
+            _wait_for_postgres_blocker(
+                waiting_pid=backend_pids["second"],
+                blocker_pid=backend_pids["first"],
+            ),
+            timeout=15,
+        )
+        allow_first_to_commit.set()
+        return await asyncio.gather(first_task, second_task)
+    finally:
+        allow_first_to_commit.set()
+        pending = [task for task in (first_task, second_task) if task is not None]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_same_payment_concurrent_allocations_conserve_payment_across_invoices():
+    suffix = uuid4().hex
+    payment_transaction_id, invoice_ids = await _create_direct_allocation_fixture(
+        suffix=suffix,
+        payment_amount=Decimal("1000"),
+        invoice_amounts=[Decimal("700"), Decimal("700")],
+    )
+    try:
+        first, second = await _run_same_payment_concurrently(
+            payment_transaction_id=payment_transaction_id,
+            requested_amount=Decimal("700"),
+        )
+        assert {first["status"], second["status"]} == {
+            "ALLOCATED",
+            "PARTIALLY_ALLOCATED",
+        }
+
+        async with TestSystemSessionLocal() as db:
+            totals = (
+                await db.execute(
+                    text(
+                        """
+                        SELECT
+                            COALESCE(SUM(pa.amount), 0) AS allocated,
+                            COALESCE((
+                                SELECT SUM(pc.amount)
+                                FROM payment_credits pc
+                                WHERE pc.payment_transaction_id = :payment_id
+                            ), 0) AS credited
+                        FROM payment_allocations pa
+                        WHERE pa.payment_transaction_id = :payment_id
+                          AND pa.status = 'ALLOCATED'
+                        """
+                    ),
+                    {"payment_id": payment_transaction_id},
+                )
+            ).mappings().one()
+            assert totals["allocated"] == Decimal("1000")
+            assert totals["credited"] == Decimal("0")
+            assert totals["allocated"] + totals["credited"] <= Decimal("1000")
+
+            invoice_states = [
+                await db.scalar(
+                    text("SELECT is_paid FROM invoices WHERE id = :id"),
+                    {"id": invoice_id},
+                )
+                for invoice_id in invoice_ids
+            ]
+            assert sorted(invoice_states) == [False, True]
+    finally:
+        await _delete_direct_allocation_fixture(
+            payment_transaction_id=payment_transaction_id,
+            invoice_ids=invoice_ids,
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_same_payment_same_invoice_concurrent_duplicate_is_idempotent():
+    suffix = uuid4().hex
+    payment_transaction_id, invoice_ids = await _create_direct_allocation_fixture(
+        suffix=suffix,
+        payment_amount=Decimal("1000"),
+        invoice_amounts=[Decimal("1000")],
+    )
+    try:
+        first, second = await _run_same_payment_concurrently(
+            payment_transaction_id=payment_transaction_id,
+            requested_amount=Decimal("700"),
+        )
+        assert first["status"] == "PARTIALLY_ALLOCATED"
+        assert second["status"] == "ALREADY_ALLOCATED"
+        assert second["reason"] == "PAYMENT_INVOICE_PAIR_EXISTS"
+        assert first["payment_allocation_id"] == second["payment_allocation_id"]
+
+        async with TestSystemSessionLocal() as db:
+            assert await db.scalar(
+                text(
+                    "SELECT COUNT(*) FROM payment_allocations "
+                    "WHERE payment_transaction_id = :id"
+                ),
+                {"id": payment_transaction_id},
+            ) == 1
+            assert await db.scalar(
+                text(
+                    "SELECT COALESCE(SUM(amount), 0) FROM payment_credits "
+                    "WHERE payment_transaction_id = :id"
+                ),
+                {"id": payment_transaction_id},
+            ) == Decimal("0")
+            assert await db.scalar(
+                text("SELECT is_paid FROM invoices WHERE id = :id"),
+                {"id": invoice_ids[0]},
+            ) is False
+    finally:
+        await _delete_direct_allocation_fixture(
+            payment_transaction_id=payment_transaction_id,
+            invoice_ids=invoice_ids,
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_sequential_allocations_and_credits_never_exceed_payment_amount():
+    suffix = uuid4().hex
+    payment_transaction_id, invoice_ids = await _create_direct_allocation_fixture(
+        suffix=suffix,
+        payment_amount=Decimal("1000"),
+        invoice_amounts=[Decimal("600"), Decimal("600")],
+    )
+    try:
+        async with TestSystemSessionLocal() as db:
+            async with db.begin():
+                first = await _direct_allocation_service(db).allocate_payment(
+                    payment_transaction_id=payment_transaction_id,
+                    tenant_id=TENANT_ID,
+                    payment_amount=Decimal("700"),
+                )
+        async with TestSystemSessionLocal() as db:
+            async with db.begin():
+                second = await _direct_allocation_service(db).allocate_payment(
+                    payment_transaction_id=payment_transaction_id,
+                    tenant_id=TENANT_ID,
+                    payment_amount=Decimal("700"),
+                )
+        async with TestSystemSessionLocal() as db:
+            async with db.begin():
+                third = await _direct_allocation_service(db).allocate_payment(
+                    payment_transaction_id=payment_transaction_id,
+                    tenant_id=TENANT_ID,
+                    payment_amount=Decimal("1000"),
+                )
+        assert first["status"] == "OVERPAYMENT_CREDITED"
+        assert second["status"] == "PARTIALLY_ALLOCATED"
+        assert third["reason"] == "PAYMENT_ALREADY_CONSUMED"
+
+        async with TestSystemSessionLocal() as db:
+            consumed = await db.scalar(
+                text(
+                    """
+                    SELECT
+                        COALESCE((SELECT SUM(amount) FROM payment_allocations
+                                  WHERE payment_transaction_id = :id
+                                    AND status = 'ALLOCATED'), 0)
+                        + COALESCE((SELECT SUM(amount) FROM payment_credits
+                                    WHERE payment_transaction_id = :id), 0)
+                    """
+                ),
+                {"id": payment_transaction_id},
+            )
+            assert consumed == Decimal("1000")
+    finally:
+        await _delete_direct_allocation_fixture(
+            payment_transaction_id=payment_transaction_id,
+            invoice_ids=invoice_ids,
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_downstream_failure_rolls_back_allocation_credit_and_invoice_state():
+    suffix = uuid4().hex
+    payment_transaction_id, invoice_ids = await _create_direct_allocation_fixture(
+        suffix=suffix,
+        payment_amount=Decimal("1000"),
+        invoice_amounts=[Decimal("700")],
+    )
+    try:
+        with pytest.raises(RuntimeError, match="simulated downstream failure"):
+            async with TestSystemSessionLocal() as db:
+                async with db.begin():
+                    result = await _direct_allocation_service(db).allocate_payment(
+                        payment_transaction_id=payment_transaction_id,
+                        tenant_id=TENANT_ID,
+                        payment_amount=Decimal("1000"),
+                    )
+                    assert result["status"] == "OVERPAYMENT_CREDITED"
+                    raise RuntimeError("simulated downstream failure")
+
+        async with TestSystemSessionLocal() as db:
+            assert await db.scalar(
+                text("SELECT COUNT(*) FROM payment_allocations WHERE payment_transaction_id = :id"),
+                {"id": payment_transaction_id},
+            ) == 0
+            assert await db.scalar(
+                text("SELECT COUNT(*) FROM payment_credits WHERE payment_transaction_id = :id"),
+                {"id": payment_transaction_id},
+            ) == 0
+            assert await db.scalar(
+                text("SELECT is_paid FROM invoices WHERE id = :id"),
+                {"id": invoice_ids[0]},
+            ) is False
+    finally:
+        await _delete_direct_allocation_fixture(
+            payment_transaction_id=payment_transaction_id,
+            invoice_ids=invoice_ids,
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_payment_without_unpaid_invoice_becomes_tenant_credit_atomically():
+    suffix = uuid4().hex[:12]
+    receipt = f"IT-NO-INVOICE-{suffix}"
+    merchant = f"IT-NO-INVOICE-MERCHANT-{suffix}"
+    checkout = f"IT-NO-INVOICE-CHECKOUT-{suffix}"
+    tenant_id, unit_id = uuid4(), uuid4()
+    payer_phone = f"254{uuid4().int % 1_000_000_000:09d}"
+    payment_amount = Decimal("275.00")
+
+    async with TestSystemSessionLocal() as db:
+        await db.execute(text("""
+            INSERT INTO units (
+                id, property_id, landlord_id, unit_number, base_rent
+            ) VALUES (
+                :unit_id, '22222222-2222-2222-2222-222222222222',
+                :landlord_id, :unit_number, 100
+            )
+        """), {
+            "unit_id": unit_id,
+            "landlord_id": LANDLORD_ID,
+            "unit_number": f"NI-{suffix}",
+        })
+        await db.execute(text("""
+            INSERT INTO tenants (
+                id, landlord_id, unit_id, full_name, primary_phone,
+                lease_start_date
+            ) VALUES (
+                :tenant_id, :landlord_id, :unit_id, 'No Invoice Tenant',
+                :phone, CURRENT_DATE
+            )
+        """), {
+            "tenant_id": tenant_id,
+            "landlord_id": LANDLORD_ID,
+            "unit_id": unit_id,
+            "phone": payer_phone,
+        })
+        await db.commit()
+    await _record_stk_request(merchant, checkout)
+
+    try:
+        async with _webhook_client() as client:
+            response = await client.post(
+                WEBHOOK_URL,
+                json=callback_payload(
+                    receipt,
+                    merchant,
+                    checkout,
+                    int(payment_amount),
+                    payer_phone=payer_phone,
+                ),
+            )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["ResultCode"] == 0
+        assert body["reconciliation"]["status"] == "MATCHED"
+        allocation_result = body["reconciliation"]["allocation"]
+        assert allocation_result["status"] == "UNALLOCATED"
+        assert allocation_result["reason"] == "NO_UNPAID_INVOICE"
+        assert Decimal(str(allocation_result["credited_amount"])) == payment_amount
+
+        transaction_id = body["reconciliation"]["payment_transaction_id"]
+        async with TestSystemSessionLocal() as db:
+            payment = (await db.execute(text("""
+                SELECT amount, tenant_id FROM payment_transactions WHERE id = :id
+            """), {"id": transaction_id})).one()
+            credit = (await db.execute(text("""
+                SELECT amount, tenant_id, status FROM payment_credits
+                WHERE payment_transaction_id = :id
+            """), {"id": transaction_id})).one()
+            assert payment[0] == payment_amount
+            assert payment[1] == tenant_id
+            assert credit[0] == payment_amount
+            assert credit[1] == tenant_id
+            assert credit[2] == "AVAILABLE"
+            assert await db.scalar(text("""
+                SELECT count(*) FROM payment_allocations
+                WHERE payment_transaction_id = :id
+            """), {"id": transaction_id}) == 0
+            assert await db.scalar(text("""
+                SELECT count(*) FROM invoices WHERE tenant_id = :tenant_id
+            """), {"tenant_id": tenant_id}) == 0
+            assert await db.scalar(text("""
+                SELECT amount FROM ledger_entries WHERE payment_transaction_id = :id
+            """), {"id": transaction_id}) == payment_amount
+            assert await db.scalar(text("""
+                SELECT count(*) FROM outbox_events WHERE aggregate_id = :id
+            """), {"id": transaction_id}) == 1
+            consumed = await db.scalar(text("""
+                SELECT
+                    COALESCE((SELECT sum(amount) FROM payment_allocations
+                              WHERE payment_transaction_id = :id
+                                AND status = 'ALLOCATED'), 0)
+                    + COALESCE((SELECT sum(amount) FROM payment_credits
+                                WHERE payment_transaction_id = :id), 0)
+            """), {"id": transaction_id})
+            assert consumed == payment_amount
+    finally:
+        async with TestSystemSessionLocal() as db:
+            await db.execute(text("""
+                DELETE FROM outbox_events
+                WHERE aggregate_id IN (
+                    SELECT id FROM payment_transactions WHERE mpesa_receipt_number = :receipt
+                )
+            """), {"receipt": receipt})
+            await db.execute(text("""
+                DELETE FROM ledger_entries
+                WHERE payment_transaction_id IN (
+                    SELECT id FROM payment_transactions WHERE mpesa_receipt_number = :receipt
+                )
+            """), {"receipt": receipt})
+            await db.execute(text("""
+                DELETE FROM payment_credits
+                WHERE payment_transaction_id IN (
+                    SELECT id FROM payment_transactions WHERE mpesa_receipt_number = :receipt
+                )
+            """), {"receipt": receipt})
+            await db.execute(text("""
+                DELETE FROM payment_allocations
+                WHERE payment_transaction_id IN (
+                    SELECT id FROM payment_transactions WHERE mpesa_receipt_number = :receipt
+                )
+            """), {"receipt": receipt})
+            await db.execute(text(
+                "DELETE FROM unassigned_payments WHERE mpesa_receipt_number = :receipt"
+            ), {"receipt": receipt})
+            await db.execute(text(
+                "DELETE FROM payment_transactions WHERE mpesa_receipt_number = :receipt"
+            ), {"receipt": receipt})
+            await db.execute(text(
+                "DELETE FROM payment_processing WHERE mpesa_receipt_number = :receipt"
+            ), {"receipt": receipt})
+            await db.execute(text("""
+                DELETE FROM raw_payment_webhooks
+                WHERE mpesa_receipt_number = :receipt OR merchant_request_id = :merchant
+            """), {"receipt": receipt, "merchant": merchant})
+            await db.execute(text(
+                "DELETE FROM stk_push_requests WHERE checkout_request_id = :checkout"
+            ), {"checkout": checkout})
+            await db.execute(text("DELETE FROM tenants WHERE id = :id"), {"id": tenant_id})
+            await db.execute(text("DELETE FROM units WHERE id = :id"), {"id": unit_id})
+            await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_concurrent_no_invoice_allocations_create_one_full_payment_credit():
+    payment_amount = Decimal("1000")
+    payment_transaction_id, invoice_ids = await _create_direct_allocation_fixture(
+        suffix=uuid4().hex,
+        payment_amount=payment_amount,
+        invoice_amounts=[],
+    )
+    try:
+        first, second = await _run_same_payment_concurrently(
+            payment_transaction_id=payment_transaction_id,
+            requested_amount=payment_amount,
+        )
+        assert first["status"] == "UNALLOCATED"
+        assert first["reason"] == "NO_UNPAID_INVOICE"
+        assert first["credited_amount"] == payment_amount
+        assert second["reason"] == "PAYMENT_ALREADY_CONSUMED"
+
+        async with TestSystemSessionLocal() as db:
+            assert await db.scalar(text("""
+                SELECT count(*) FROM payment_allocations
+                WHERE payment_transaction_id = :id
+            """), {"id": payment_transaction_id}) == 0
+            assert await db.scalar(text("""
+                SELECT count(*) FROM payment_credits
+                WHERE payment_transaction_id = :id
+            """), {"id": payment_transaction_id}) == 1
+            assert await db.scalar(text("""
+                SELECT amount FROM payment_credits
+                WHERE payment_transaction_id = :id
+            """), {"id": payment_transaction_id}) == payment_amount
+    finally:
+        await _delete_direct_allocation_fixture(
+            payment_transaction_id=payment_transaction_id,
+            invoice_ids=invoice_ids,
+        )

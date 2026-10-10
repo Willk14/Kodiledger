@@ -1,0 +1,6 @@
+on_http_request:
+  # Expose only the M-Pesa callback route through this temporary tunnel.
+  - expressions:
+      - "req.url.path != '/api/v1/webhooks/mpesa'"
+    actions:
+      - type: deny

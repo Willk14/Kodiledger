@@ -1,11 +1,9 @@
 BEGIN;
 
--- Replace the system role's global BYPASSRLS capability with explicit
--- table policies. The system connection remains high-trust and can access
--- every row on these named tables for webhook and background workflows, but
--- does not bypass RLS on future tables by default.
-
-ALTER ROLE kodiflow_system NOBYPASSRLS;
+-- Migration 0011 creates kodiflow_system with NOBYPASSRLS. Do not ALTER ROLE
+-- here: managed PostgreSQL providers (including Render) do not let the
+-- database owner change role-level BYPASSRLS attributes. Grant explicit
+-- access to the named tables instead; future tables remain protected by RLS.
 
 DO $$
 DECLARE

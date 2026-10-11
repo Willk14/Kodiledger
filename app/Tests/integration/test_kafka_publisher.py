@@ -7,7 +7,7 @@ import uuid
 import pytest
 from aiokafka import AIOKafkaConsumer
 
-from app.core.config import settings
+from app.configs.environment import settings
 from app.integrations.events.kafka_publisher import KafkaEventPublisher
 
 

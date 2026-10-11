@@ -91,7 +91,7 @@ def _assert_safe_configuration(config: dict[str, str]) -> None:
         raise RuntimeError("RLS test database port does not match RLS_TEST_PORT.")
 
     # Protect against accidentally aliasing either configured application DB.
-    from app.core.config import settings
+    from app.configs.environment import settings
 
     target = _target(admin)
     for configured in (settings.DATABASE_URL, settings.SYSTEM_DATABASE_URL):

@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_db, get_system_db
+from app.configs.database import get_db, get_system_db
 
 from app.repositories.invoice_repository import InvoiceRepository
 from app.repositories.landlord_repository import LandlordRepository

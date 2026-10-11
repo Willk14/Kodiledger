@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from app.core.config import settings
-from app.core.database import SystemSessionLocal
+from app.configs.environment import settings
+from app.configs.database import SystemSessionLocal
 from app.integrations.events.kafka_publisher import KafkaEventPublisher
 from app.services.outbox_worker import OutboxWorker
 

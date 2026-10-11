@@ -4,7 +4,7 @@ from fastapi import Depends
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_db
+from app.configs.database import get_db
 from app.security.dependencies import get_current_principal
 from app.security.principals import Principal
 

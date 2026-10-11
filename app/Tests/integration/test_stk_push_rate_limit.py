@@ -7,8 +7,8 @@ import pytest
 import redis.asyncio as redis
 from fastapi import FastAPI
 
-import app.api.v1.endpoints.payments as payments_module
-from app.core.config import settings
+import app.controllers.payments as payments_module
+from app.configs.environment import settings
 from app.core.rate_limiter import rate_limiter
 
 

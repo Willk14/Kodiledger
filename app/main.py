@@ -4,26 +4,31 @@ from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from app.api.v1.endpoints.webhooks import router as webhooks_router
-from app.api.v1.endpoints.payments import router as payments_router
-from app.api.v1.endpoints.properties import router as properties_router
-from app.api.v1.endpoints.units import router as units_router
-from app.api.v1.endpoints.tenants import router as tenants_router
-from app.api.v1.endpoints.invoices import router as invoices_router
-from app.api.v1.endpoints.unassigned_payments import router as unassigned_payments_router
-from app.api.v1.endpoints.ledger import router as ledger_router
-from app.api.v1.endpoints.Bff.landlord import (
+from app.controllers.webhooks import router as webhooks_router
+from app.controllers.payments import router as payments_router
+from app.controllers.properties import router as properties_router
+from app.controllers.units import router as units_router
+from app.controllers.tenants import router as tenants_router
+from app.controllers.invoices import router as invoices_router
+from app.controllers.unassigned_payments import router as unassigned_payments_router
+from app.controllers.ledger import router as ledger_router
+from app.controllers.system import router as system_router
+from app.controllers.bff.landlord import (
     router as landlord_bff_router,
 )
-from app.api.v1.endpoints.Bff.caretaker import (
+from app.controllers.bff.caretaker import (
     router as caretaker_bff_router,
 )
-from app.core.config import settings
-from app.core.database import engine, system_engine
+from app.configs.app import (
+    APP_DESCRIPTION,
+    APP_TITLE,
+    APP_VERSION,
+    configure_cors,
+)
+from app.configs.database import engine, system_engine
 
 
 async def _check_database_connection(database_engine: AsyncEngine, name: str) -> None:
@@ -52,12 +57,9 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 # ============================================================
 
 app = FastAPI(
-    title="KodiFlow API",
-    description=(
-        "Multi-tenant M-Pesa Rent Reconciliation "
-        "& Property Management Engine"
-    ),
-    version="1.0.0",
+    title=APP_TITLE,
+    description=APP_DESCRIPTION,
+    version=APP_VERSION,
     lifespan=lifespan,
 )
 
@@ -66,19 +68,7 @@ app = FastAPI(
 # CORS
 # ============================================================
 
-allowed_origins = [
-    origin.strip()
-    for origin in settings.CORS_ALLOWED_ORIGINS.split(",")
-    if origin.strip()
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "Idempotency-Key"],
-)
+configure_cors(app)
 
 
 # ============================================================
@@ -144,10 +134,5 @@ app.include_router(
 # Root / Health
 # ============================================================
 
-@app.get("/", tags=["System"])
-async def root() -> dict[str, str]:
-    return {
-        "status": "online",
-        "system": "KodiFlow Backend Engine",
-    }
+app.include_router(system_router)
 

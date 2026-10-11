@@ -6,7 +6,7 @@ PostgreSQL is KodiLedger's authoritative persistent store. Financial records, we
 
 The application persistence layer uses SQLAlchemy's asynchronous engine and `AsyncSession` APIs. `app/models/base.py` defines the shared declarative base used by the mapped models. PostgreSQL connections use the `asyncpg` driver (`asyncpg` is a project dependency), and connection URLs are supplied through `DATABASE_URL` and `SYSTEM_DATABASE_URL`.
 
-`app/core/database.py` creates two independent async engines and session factories:
+`app/configs/database.py` creates two independent async engines and session factories:
 
 - **Application connection:** `engine` and `AsyncSessionLocal`, exposed through `get_db()`. The source comments describe this as the normal `kodiflow_app` connection with row-level security (RLS) enforced.
 - **System connection:** `system_engine` and `SystemSessionLocal`, exposed through `get_system_db()`. The webhook endpoint and Outbox worker use this connection for trusted system workflows. `kodiflow_system` has no role-level `BYPASSRLS`; migration `0019_system_role_rls_policies.sql` grants it explicit system-only policies on the RLS-protected tables required by those workflows.

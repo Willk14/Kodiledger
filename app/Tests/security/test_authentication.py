@@ -12,8 +12,8 @@ from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import SecretStr
 import jwt
 
-from app.core.config import settings
-from app.core.database import get_db
+from app.configs.environment import settings
+from app.configs.database import get_db
 from app.main import app
 import app.security.authentication as authentication
 import app.security.dependencies as dependencies

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from app.core.database import SystemSessionLocal
+from app.configs.database import SystemSessionLocal
 from app.services.webhook_replay_worker import WebhookReplayWorker
 
 

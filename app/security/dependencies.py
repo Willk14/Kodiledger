@@ -5,7 +5,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_db
+from app.configs.database import get_db
 
 from app.security.authentication import (
     AuthenticationConfigurationError,

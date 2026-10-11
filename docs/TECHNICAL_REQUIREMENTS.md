@@ -1,16 +1,17 @@
 # KodiLedger Technical Requirements
 
-This document records the technical baseline for developing the KodiLedger application and its planned web frontend. It describes current backend behavior separately from frontend and deployment requirements. It does not replace the endpoint-level contract in [API.md](API.md), the identity rules in [auth.md](auth.md), or the database details in [DATABASE.md](DATABASE.md).
+This document records KodiLedger's technical requirements, current implementation, and staging baseline. It distinguishes implemented behavior from planned frontend and deployment work. It does not replace the endpoint-level contract in [API.md](API.md), the identity rules in [auth.md](auth.md), or the database details in [DATABASE.md](DATABASE.md).
 
 ## 1. Status and scope
 
 | Area | Current status |
 |---|---|
 | Backend | FastAPI, Python, SQLAlchemy async, and PostgreSQL migrations are present. |
-| Supabase PostgreSQL | The application is configured to use PostgreSQL-compatible connections and RLS. Deployment-specific role and policy behavior must be verified in the target Supabase project. |
+| Render PostgreSQL staging | A Render staging database has been provisioned and the migration/grant steps have been run according to the staging work log. The API service is still being configured; successful deployment and application-level verification are not yet established. |
 | Authentication | OIDC bearer-token verification and local KodiLedger membership lookup are implemented for selected routes. Login, account provisioning, and membership selection are not implemented by the backend. |
-| Frontend | No frontend source or package manifest is currently present. The documented target is Next.js, React, TypeScript, with a responsive/PWA-capable experience. |
-| CI | The workflow has a dedicated PostgreSQL RLS test database. The ordinary application database on port 5434 has previously failed to connect in CI; verify its provisioning and rerun the checks before treating the branch as merge-ready. |
+| Frontend | The frontend is maintained separately from this backend repository. The target is Next.js, React, and TypeScript; its deployment and API-origin configuration must be verified independently. |
+| Staging services | Render is the current staging target for the backend API, PostgreSQL, and Redis-compatible Key Value service. Do not treat a configured dashboard form as a deployed or healthy service. |
+| CI | CI includes PostgreSQL-backed checks. Confirm current workflow results and provisioned dependencies before treating a branch as merge-ready. |
 
 This document is a baseline for frontend implementation, not a claim that all listed deployment requirements have already been satisfied.
 
@@ -25,7 +26,7 @@ Browser frontend (planned)
         v
 FastAPI API
         |
-        +-- SQLAlchemy async / asyncpg --> PostgreSQL / Supabase
+        +-- SQLAlchemy async / asyncpg --> Render PostgreSQL (staging target)
         |                                    financial source of truth
         +-- Redis -------------------------> rate limits and coordination
         +-- M-Pesa Daraja -----------------> STK initiation and callbacks
@@ -41,7 +42,7 @@ The backend has separate application and system PostgreSQL connections. User-sco
 - The API is FastAPI/Python and validates HTTP input with Pydantic schemas.
 - Persistence uses SQLAlchemy asynchronous sessions and PostgreSQL through `asyncpg`.
 - Ordered SQL files under `db/migrations/` define the database schema and policy changes. Apply migrations through the documented deployment/test process; do not rely on SQLAlchemy model metadata alone to create production schema.
-- Supabase connections must use TLS as configured by the environment. Keep application and system database URLs separate.
+- Staging and production PostgreSQL connections must use TLS as configured by the host. On Render, backend services should use the database's internal URL; local administration uses the external connection details. Keep application and system database URLs separate.
 - Preserve PostgreSQL `NUMERIC`/Python `Decimal` semantics for money. Financial writes that form one workflow must remain in a single PostgreSQL transaction.
 - PostgreSQL constraints and locking are part of correctness: receipt uniqueness, allocation/credit constraints, transaction row locks, `ON CONFLICT`, and outbox claim locking must not be bypassed by frontend behavior.
 - RLS supplements API authorization. Business routes must continue to set transaction-local scope from the verified local membership and apply resource ownership filters.
@@ -52,9 +53,9 @@ The backend has separate application and system PostgreSQL connections. User-sco
 When the frontend is added:
 
 - Use Next.js, React, and TypeScript, with strict types and a responsive layout usable on mobile and desktop.
-- Keep API DTOs and API client code separate from page/presentation components. Use the FastAPI routes and schemas as the contract; do not access PostgreSQL or Supabase tables directly from browser code.
+- Keep API DTOs and API client code separate from page/presentation components. Use the FastAPI routes and schemas as the contract; do not access PostgreSQL tables directly from browser code.
 - Configure the API origin through a public frontend environment variable such as `NEXT_PUBLIC_API_BASE_URL`. Do not hard-code deployment hosts.
-- Use the approved public identity-provider client configuration only. Never put database credentials, M-Pesa secrets, OIDC signing secrets, or Supabase service-role keys in frontend bundles.
+- Use the approved public identity-provider client configuration only. Never put database credentials, M-Pesa secrets, OIDC signing secrets, or identity-provider service-role keys in frontend bundles.
 - Attach the current OIDC access token to protected API requests as `Authorization: Bearer <token>`. Follow the identity provider's session lifecycle; do not print tokens, persist them in ad hoc application storage, or use token role claims for authorization.
 - Implement explicit loading, empty, validation, unauthorized, forbidden, not-found, conflict, unavailable, and unexpected-error states.
 - Make forms keyboard accessible, label inputs, expose validation errors, and avoid relying on color alone for status.
@@ -142,6 +143,16 @@ Requirements:
 - Use hosting-provider ingress/load balancer or Nginx/Caddy/Traefik as appropriate to the deployment. This document does not require a specific proxy product.
 - Never commit `.env`, `.env.rls-test`, access tokens, credentials, or generated environment-specific configuration.
 
+### Render staging requirements
+
+- Deploy the API as a Render Web Service from the backend repository, in the Staging environment. Set its root directory and build/start commands to match the repository layout and Python dependency manifest.
+- Keep the API, Render PostgreSQL database, and Render Key Value service in the same region when possible. The API uses Render's **internal** database and Key Value URLs; local `psql` administration uses the database's external connection details.
+- Configure `DATABASE_URL` for the `kodiflow_app` role and `SYSTEM_DATABASE_URL` for `kodiflow_system`. Both connect to the staging database, but use separate credentials. Do not put either URL in the frontend service.
+- Configure environment-specific credentials only in Render's service environment settings. Use the backend's actual environment variable names from [RENDER_STAGING.md](RENDER_STAGING.md) and [app/configs/environment.py](../app/configs/environment.py); do not use the owner's database URL as an application URL.
+- Treat an API service as staged only after deployment succeeds, its health behavior is checked, and logs show it connected using the intended staging configuration. The root route is not a database-readiness check.
+- Configure the separately maintained frontend with the deployed staging API's public HTTPS origin and the correct public identity-provider settings. Restrict backend CORS to that exact frontend origin. Never provide the frontend with database, Redis, M-Pesa, or system-role secrets.
+- Keep staging and production resources and credentials separate. Do not copy production data or production secrets into staging without an explicit, reviewed data-handling plan.
+
 ## 10. Test and release requirements
 
 Before a frontend/API integration release:
@@ -150,7 +161,7 @@ Before a frontend/API integration release:
 - Frontend checks must include type checking, linting, and tests for API client auth/error handling, role-gated navigation, form validation, empty states, and protected-route behavior.
 - Exercise at least one landlord, caretaker, and tenant session against the API and verify both allowed access and cross-scope denial.
 - Verify that failed/expired auth, missing membership, unavailable API, validation failure, and conflict responses produce understandable UI states.
-- Verify migration application and RLS role behavior in a disposable test database; a passing unit suite alone does not prove deployed Supabase RLS configuration.
+- Verify migration application and RLS role behavior in a disposable test database; a passing unit suite alone does not prove the deployed Render database's RLS configuration.
 - Run `git diff --check` and ensure generated bundles, local secrets, and environment files are excluded from commits.
 
 ## 11. Frontend MVP acceptance criteria

@@ -5,7 +5,7 @@ from uuid import uuid4
 
 import pytest
 
-from app.core.config import settings
+from app.configs.environment import settings
 from app.integrations.events import kafka_publisher
 from app.services.event_publisher import EventPublisher
 from app.workers import outbox as outbox_worker_module

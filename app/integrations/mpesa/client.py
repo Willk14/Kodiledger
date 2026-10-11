@@ -9,7 +9,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 
-from app.core.config import settings
+from app.configs.environment import settings
 import logging
 
 logger = logging.getLogger("kodiledger.mpesa")

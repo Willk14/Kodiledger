@@ -8,8 +8,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-import app.api.v1.endpoints.payments as payments_module
-from app.core.database import get_system_db
+import app.controllers.payments as payments_module
+from app.configs.database import get_system_db
 from app.security.dependencies import get_current_principal
 from app.security.principals import AuthenticatedContext
 from app.security.roles import Role

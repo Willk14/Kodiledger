@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import redis.asyncio as redis
 from fastapi import HTTPException, Request, status
 
-from app.core.config import settings
+from app.configs.environment import settings
 
 
 @dataclass(frozen=True)

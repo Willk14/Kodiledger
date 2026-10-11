@@ -262,7 +262,7 @@ The API layer should not contain complex financial logic.
 
 For example:
 
-app/api/v1/endpoints/payments.py
+app/controllers/payments.py
 
 is responsible for receiving an STK Push request and mapping the application
 result to an HTTP response.

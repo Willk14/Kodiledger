@@ -20,8 +20,8 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.engine import make_url
 
-from app.core.config import settings
-from app.core.database import get_db
+from app.configs.environment import settings
+from app.configs.database import get_db
 from app.main import app as api_app
 from app.repositories.ledger_repository import LedgerRepository
 from app.repositories.outbox_event_repository import OutboxEventRepository

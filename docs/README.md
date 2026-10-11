@@ -97,8 +97,11 @@ Authentication is not applied across all business routes. Selected property, uni
 
 ```text
 app/
-  api/             FastAPI routes
-  core/            Settings, database sessions, and shared dependencies
+  controllers/     FastAPI HTTP request/response handlers
+  configs/         Environment settings, database sessions, and app setup
+  utils/           Small reusable parsing and data helpers
+  api/             Versioned endpoint compatibility imports
+  core/            Shared dependencies and runtime helpers
   integrations/    M-Pesa and Kafka integrations
   models/          SQLAlchemy models
   repositories/    Persistence queries
@@ -110,6 +113,17 @@ app/
 db/migrations/     Ordered PostgreSQL SQL migrations
 docs/              Product, architecture, database, and security documents
 ```
+
+Controllers own HTTP route declarations, request parsing, dependency
+injection, response schemas, and HTTP error mapping. Keep business rules in
+`app/services/` and database access in `app/repositories/`. New route handlers
+belong in `app/controllers/` and are registered by `app/main.py`. The modules
+under `app/api/v1/endpoints/` are compatibility imports for the older paths.
+Configuration is grouped under `app/configs/`: `environment.py` defines
+environment variables, `database.py` creates database engines and session
+dependencies, and `app.py` configures FastAPI metadata and CORS.
+Small cross-cutting helper functions belong in `app/utils/`; domain-specific
+rules should remain in their owning service, security, or integration module.
 
 ## 9. Prerequisites
 
@@ -140,7 +154,7 @@ The following commands use PowerShell on Windows. Do not use production credenti
    python -m pip install -r requirements.txt
    ```
 
-3. Copy `.env.example` to `.env` and fill in local values. `app/core/config.py` also requires `SYSTEM_DATABASE_URL`, which is not currently listed in `.env.example`; configure it separately. The application and system URLs must use the appropriate database roles described in [docs/SECURITY.md](docs/SECURITY.md). Configure M-Pesa values for payment testing. OIDC settings are needed for real bearer-token validation.
+3. Copy `.env.example` to `.env` and fill in local values. `app/configs/environment.py` also requires `SYSTEM_DATABASE_URL`, which is not currently listed in `.env.example`; configure it separately. The application and system URLs must use the appropriate database roles described in [docs/SECURITY.md](docs/SECURITY.md). Configure M-Pesa values for payment testing. OIDC settings are needed for real bearer-token validation.
 
    ```powershell
    Copy-Item .env.example .env
@@ -154,6 +168,8 @@ The following commands use PowerShell on Windows. Do not use production credenti
 
 5. Provision the database roles required by the migrations, then apply `db/migrations/*.sql` in numeric order using `psql` against the local PostgreSQL service (`localhost:5434`, database `kodiflow_db`). There is no migration runner configured in this repository. In particular, the `kodiflow_app` role must exist before migrations that grant or revoke its privileges. Review the database and security documentation before applying migrations; do not apply them to a production database as part of local setup.
 
+   For Render staging, follow [RENDER_STAGING.md](RENDER_STAGING.md). It covers role provisioning, the complete migration order, least-privilege grants, and the separate API connection URLs. It is a manual runbook; migrations are not run automatically by deployment.
+
 6. Start the API from the repository root:
 
    ```powershell
@@ -164,11 +180,11 @@ The following commands use PowerShell on Windows. Do not use production credenti
 
 ## 11. Environment Configuration
 
-Settings are loaded from environment variables and `.env` by Pydantic Settings. The names below are defined by [app/core/config.py](app/core/config.py); values are intentionally omitted.
+Settings are loaded from environment variables and `.env` by Pydantic Settings. The names below are defined by [environment.py](../app/configs/environment.py); values are intentionally omitted.
 
 | Group | Settings |
 | --- | --- |
-| PostgreSQL | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `POSTGRES_HOST`, `POSTGRES_PORT`, `DATABASE_URL`, `SYSTEM_DATABASE_URL` |
+| PostgreSQL | `DATABASE_URL`, `SYSTEM_DATABASE_URL`; `POSTGRES_*` are legacy/local Docker Compose settings |
 | Redis | `REDIS_URL`, `RATE_LIMIT_STK_PUSH_REQUESTS`, `RATE_LIMIT_STK_PUSH_WINDOW_SECONDS` |
 | M-Pesa | `MPESA_CONSUMER_KEY`, `MPESA_CONSUMER_SECRET`, `MPESA_PASSKEY`, `MPESA_SHORTCODE`, `MPESA_BASE_URL`, `MPESA_CALLBACK_URL`, `MPESA_CALLBACK_TOKEN`, `MPESA_CALLBACK_ALLOWED_IPS` |
 | OIDC | `OIDC_ISSUER_URL`, `OIDC_AUDIENCE`, `OIDC_JWKS_URL`, `OIDC_SIGNING_ALGORITHMS`, `OIDC_JWKS_TIMEOUT_SECONDS` |
@@ -235,6 +251,8 @@ Financial workflow changes need integration and concurrency coverage because cor
 | [DATABASE.md](DATABASE.md) | Database connections, schema, constraints, and data relationships |
 | [auth.md](auth.md) | Authentication, authorization, role/scope rules, and current route matrix |
 | [SECURITY.md](SECURITY.md) | Security controls, status, and known gaps |
+| [TECHNICAL_REQUIREMENTS.md](TECHNICAL_REQUIREMENTS.md) | Technical baseline, staging requirements, security constraints, and release criteria |
+| [TradeOffs.md](TradeOffs.md) | Implemented design trade-offs, what each choice optimizes for, and its costs |
 | [API.md](API.md) | Implemented HTTP API contracts and behavior |
 | [TESTING.md](TESTING.md) | Local test commands and integration-test setup |
 | [decisions.md](decisions.md) | Accepted technical decisions and conditions for revisiting them |

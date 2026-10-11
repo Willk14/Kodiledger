@@ -309,6 +309,29 @@ For matched callback payments, the verified path is: HTTP callback → trusted s
 
 ACID describes the PostgreSQL transaction boundary; it does not make a multi-system HTTP workflow spanning PostgreSQL, Redis, Safaricom, and Kafka one atomic transaction.
 
+### API classification: ACID in PostgreSQL, read-only/basic, or external workflow
+
+“ACID” and “basic” are not mutually exclusive properties of an HTTP API. The classifications below describe the current database work performed by each route. PostgreSQL transactions provide ACID guarantees for the writes inside their transaction; they do not make calls to Safaricom, Redis, or Kafka part of that transaction. Read-only routes do not have a financial write transaction to classify.
+
+| Route(s) | Current classification | Transaction boundary |
+|---|---|---|
+| `GET /` | Basic health response | Returns process status only; does not check PostgreSQL or other dependencies. |
+| `GET /docs`, `GET /redoc`, `GET /openapi.json` | Basic/read-only documentation | Serves the generated OpenAPI description and interactive documentation; no financial mutation. |
+| `GET /api/v1/bff/caretaker/me` | Basic/read-only | Returns verified membership context; no business-row write. |
+| `GET /api/v1/bff/landlord/me` | Basic/read-only | Reads the authenticated landlord's property count; no financial mutation. |
+| `GET /api/v1/properties`, `GET /api/v1/properties/{property_id}` | Basic/read-only | Scoped PostgreSQL reads. |
+| Unit, tenant, invoice, payment, allocation, credit, unassigned-payment, and ledger `GET` routes | Basic/read-only | Scoped PostgreSQL reads; each request observes committed data at the database's configured isolation level. |
+| `POST /api/v1/properties/{property_id}/units`, `PATCH /api/v1/units/{unit_id}` | ACID in PostgreSQL | Unit creation and the property's unit-count update commit together; unit updates commit as database writes. Conflicts roll back. |
+| `POST /api/v1/tenants` | ACID in PostgreSQL | Tenant creation is committed as a database write; it does not include external services. |
+| `POST /api/v1/invoices` | ACID in PostgreSQL | Ownership checks, invoice insertion, and application of available payment credits run in the request transaction; errors roll it back. |
+| `POST /api/v1/unassigned-payments/{payment_id}/resolve` | ACID financial write set in PostgreSQL | Assignment, allocation or credit, ledger, processing state, and outbox writes commit together or roll back together. |
+| `POST /api/v1/webhooks/mpesa` | Mixed; ACID financial processing in PostgreSQL | The callback inbox is committed first. Reconciliation then commits its financial write set atomically. Redis is only a fast-path lock; retries cover processing failures. No distributed ACID transaction spans the provider or event transport. |
+| `POST /api/v1/payments/stk-push` | Basic external workflow; not end-to-end ACID | Safaricom is called first; a successful initiation may then be recorded in PostgreSQL. A database rollback cannot undo the provider request, and HTTP success does not confirm payment. |
+| `GET /api/v1/payments/stk-push/unresolved` | Basic/read-only | Reads the operator queue; it does not reconcile payments. |
+| `POST /api/v1/payments/stk-push/{checkout_request_id}/query` | Basic external workflow; not end-to-end ACID | The API records query state around a Safaricom status call using separate database commits. Those commits cannot make the external call atomic with PostgreSQL. |
+
+All current registered routes are covered by this classification table. The detailed route contracts above remain authoritative for authentication, response shapes, and errors. Application service responsibilities are summarized in [service.md](service.md).
+
 ### PostgreSQL transaction guarantees
 
 - **Atomicity:** Unit creation inserts the unit and updates the property's `total_units` in the same transaction. Tenant creation inserts one tenant row. Invoice creation performs its landlord/property/unit/tenant checks and insert in the same request transaction; a duplicate invoice number rolls the insert back and returns 409. These writes commit before a successful response is returned. Failed database writes are rolled back when caught by the service or when the request-scoped session is closed.

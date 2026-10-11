@@ -3,7 +3,7 @@ from typing import Any
 
 from sqlalchemy import text
 
-from app.core.config import settings
+from app.configs.environment import settings
 
 from app.repositories.landlord_repository import LandlordRepository
 from app.repositories.payment_processing_repository import (

@@ -3,7 +3,7 @@ import asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from app.core.config import settings
+from app.configs.environment import settings
 
 
 async def main():

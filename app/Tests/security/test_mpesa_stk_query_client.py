@@ -7,7 +7,7 @@ import pytest
 from unittest.mock import AsyncMock
 
 from app.integrations.mpesa.client import MpesaClient
-from app.core.config import settings
+from app.configs.environment import settings
 
 
 @pytest.mark.asyncio

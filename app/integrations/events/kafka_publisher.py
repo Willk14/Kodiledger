@@ -5,7 +5,7 @@ from typing import Any
 
 from aiokafka import AIOKafkaProducer
 
-from app.core.config import settings
+from app.configs.environment import settings
 from app.services.event_publisher import EventPublisher
 
 

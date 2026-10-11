@@ -7,7 +7,8 @@ from urllib.parse import urlparse
 
 import jwt
 
-from app.core.config import settings
+from app.configs.environment import settings
+from app.utils.text import split_csv_values
 
 
 class AuthenticationError(Exception):
@@ -48,11 +49,7 @@ def _oidc_settings() -> tuple[str, str, str, list[str]]:
     issuer = settings.OIDC_ISSUER_URL.strip()
     audience = settings.OIDC_AUDIENCE.strip()
     jwks_url = settings.OIDC_JWKS_URL.strip()
-    algorithms = [
-        value.strip()
-        for value in settings.OIDC_SIGNING_ALGORITHMS.split(",")
-        if value.strip()
-    ]
+    algorithms = split_csv_values(settings.OIDC_SIGNING_ALGORITHMS)
 
     if not issuer or not audience or not jwks_url:
         raise AuthenticationConfigurationError(

@@ -5,7 +5,8 @@ from ipaddress import ip_address, ip_network
 
 from fastapi import HTTPException, Request, status
 
-from app.core.config import settings
+from app.configs.environment import settings
+from app.utils.text import split_csv_values
 
 
 def enforce_mpesa_callback_token(request: Request) -> None:
@@ -50,9 +51,8 @@ def enforce_mpesa_callback_source(request: Request) -> None:
     try:
         source_ip = ip_address(client.host) if client is not None else None
         networks = [
-            ip_network(value.strip(), strict=False)
-            for value in settings.MPESA_CALLBACK_ALLOWED_IPS.split(",")
-            if value.strip()
+            ip_network(value, strict=False)
+            for value in split_csv_values(settings.MPESA_CALLBACK_ALLOWED_IPS)
         ]
     except ValueError as exc:
         raise HTTPException(

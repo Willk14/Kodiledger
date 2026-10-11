@@ -2,7 +2,7 @@ import pytest
 from fastapi import HTTPException
 from starlette.requests import Request
 
-from app.core.config import settings
+from app.configs.environment import settings
 from app.security.mpesa_callback import (
     enforce_mpesa_callback_source,
     enforce_mpesa_callback_token,

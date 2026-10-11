@@ -3,7 +3,7 @@ import secrets
 
 import redis.asyncio as aioredis
 
-from app.core.config import settings
+from app.configs.environment import settings
 
 
 IDEMPOTENCY_TTL_SECONDS = 86400

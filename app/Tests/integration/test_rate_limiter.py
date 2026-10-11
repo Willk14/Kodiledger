@@ -5,7 +5,7 @@ from uuid import uuid4
 import pytest
 import redis.asyncio as redis
 
-from app.core.config import settings
+from app.configs.environment import settings
 from app.core.rate_limiter import RedisRateLimiter
 
 

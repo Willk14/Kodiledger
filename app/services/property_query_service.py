@@ -7,10 +7,15 @@ from app.repositories.property_repository import PropertyRepository
 
 
 class PropertyQueryService:
-    """Application operations for landlord-scoped property reads."""
+    """Application operations for landlord-scoped properties."""
 
     def __init__(self, repository: PropertyRepository) -> None:
         self.repository = repository
+
+    async def create_for_landlord(
+        self, landlord_id: str, values: dict[str, object]
+    ) -> Property:
+        return await self.repository.create(UUID(landlord_id), values)
 
     async def list_for_landlord(self, landlord_id: str) -> list[Property]:
         return await self.repository.list_by_landlord(UUID(landlord_id))

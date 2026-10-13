@@ -9,10 +9,18 @@ from app.models.property import Property
 
 
 class PropertyRepository:
-    """Read property records visible to a landlord."""
+    """Read and create landlord-scoped property records."""
 
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
+
+    async def create(self, landlord_id: UUID, values: dict[str, object]) -> Property:
+        property_record = Property(landlord_id=landlord_id, **values)
+        self.db.add(property_record)
+        await self.db.flush()
+        await self.db.refresh(property_record)
+        await self.db.commit()
+        return property_record
 
     async def list_by_landlord(self, landlord_id: UUID) -> list[Property]:
         statement = (

@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.repositories.property_repository import PropertyRepository
-from app.schemas.property import PropertyRead
+from app.schemas.property import PropertyCreate, PropertyRead
 from app.security.authorization import (
     require_landlord_context,
     require_role_and_permission,
@@ -51,6 +51,28 @@ async def list_properties(
     landlord_id = require_landlord_context(principal)
     properties = await _service(db).list_for_landlord(landlord_id)
     return [PropertyRead.model_validate(item) for item in properties]
+
+
+@router.post(
+    "",
+    response_model=PropertyRead,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a landlord property",
+    responses={401: {"description": "Authentication required."}, 403: {"description": "Landlord property-write permission is required."}},
+)
+async def create_property(
+    request: PropertyCreate,
+    principal: Annotated[
+        Principal,
+        Depends(require_role_and_permission(Role.LANDLORD, Permission.PROPERTY_WRITE)),
+    ],
+    db: RlsSession,
+) -> PropertyRead:
+    landlord_id = require_landlord_context(principal)
+    property_record = await _service(db).create_for_landlord(
+        landlord_id, request.model_dump()
+    )
+    return PropertyRead.model_validate(property_record)
 
 
 @router.get(

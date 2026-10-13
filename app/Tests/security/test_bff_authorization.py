@@ -573,7 +573,7 @@ def test_registered_api_surface_matches_frozen_openapi_contract():
         "/api/v1/payments/stk-push": {"post"},
         "/api/v1/payments/stk-push/unresolved": {"get"},
         "/api/v1/payments/stk-push/{checkout_request_id}/query": {"post"},
-        "/api/v1/properties": {"get"},
+        "/api/v1/properties": {"get", "post"},
         "/api/v1/properties/{property_id}": {"get"},
         "/api/v1/properties/{property_id}/units": {"get", "post"},
         "/api/v1/units/{unit_id}": {"get", "patch"},

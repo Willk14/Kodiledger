@@ -29,7 +29,7 @@ The code defines `LANDLORD`, `CARETAKER`, `TENANT`, `ADMIN`, and `SYSTEM`. The f
 
 | Role | Current API route access | Scope resolution |
 |---|---|---|
-| LANDLORD | Landlord context, property, unit, tenant, invoice, payment/allocation/credit read, ledger, and unassigned-payment routes, subject to each route's permission | Active membership's landlord ID; resource queries are constrained by ownership filters and PostgreSQL RLS |
+| LANDLORD | Landlord context, property create/read, unit, tenant, invoice, payment/allocation/credit read, ledger, and unassigned-payment routes, subject to each route's permission | Active membership's landlord ID; resource queries are constrained by ownership filters and PostgreSQL RLS |
 | CARETAKER | `/api/v1/bff/caretaker/me`; unit and tenant reads (`UNIT_READ` / `TENANT_READ`) | Active membership's landlord ID; resource queries are constrained by ownership filters and PostgreSQL RLS |
 | TENANT | `GET /api/v1/tenants/me` requires `TENANT_READ`; no invoice route currently | Active membership's tenant and landlord IDs; tenant query is constrained by both values and PostgreSQL RLS |
 | ADMIN | STK unresolved request queue and status query require `PAYMENT_READ` | Membership must have no landlord or tenant scope; these routes use the trusted system DB session |
@@ -320,6 +320,7 @@ ACID describes the PostgreSQL transaction boundary; it does not make a multi-sys
 | `GET /api/v1/bff/caretaker/me` | Basic/read-only | Returns verified membership context; no business-row write. |
 | `GET /api/v1/bff/landlord/me` | Basic/read-only | Reads the authenticated landlord's property count; no financial mutation. |
 | `GET /api/v1/properties`, `GET /api/v1/properties/{property_id}` | Basic/read-only | Scoped PostgreSQL reads. |
+| `POST /api/v1/properties` | ACID in PostgreSQL | Creates a property in the authenticated landlord's scope. |
 | Unit, tenant, invoice, payment, allocation, credit, unassigned-payment, and ledger `GET` routes | Basic/read-only | Scoped PostgreSQL reads; each request observes committed data at the database's configured isolation level. |
 | `POST /api/v1/properties/{property_id}/units`, `PATCH /api/v1/units/{unit_id}` | ACID in PostgreSQL | Unit creation and the property's unit-count update commit together; unit updates commit as database writes. Conflicts roll back. |
 | `POST /api/v1/tenants` | ACID in PostgreSQL | Tenant creation is committed as a database write; it does not include external services. |

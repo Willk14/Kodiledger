@@ -7,7 +7,7 @@ This document summarizes the Python modules in `app/services/`. These classes co
 | Service | Responsibility |
 |---|---|
 | [`LandlordService`](../app/services/landlord_service.py) | Provides landlord context data, including the count of properties in the authenticated landlord's scope. |
-| [`PropertyQueryService`](../app/services/property_query_service.py) | Lists and retrieves properties for a landlord. It is read-only. |
+| [`PropertyQueryService`](../app/services/property_query_service.py) | Lists, retrieves, and creates properties for a landlord. |
 | [`UnitService`](../app/services/unit_service.py) | Lists and retrieves landlord-scoped units, creates units, updates unit fields, and translates database uniqueness conflicts into a domain conflict. Unit creation also updates the parent property's unit count in the repository transaction. |
 | [`TenantService`](../app/services/tenant_service.py) | Lists and retrieves tenants by landlord, resolves a tenant from authenticated membership context, and creates tenants under a landlord-owned unit. |
 | [`InvoiceService`](../app/services/invoice_service.py) | Lists and retrieves landlord-scoped invoices. On creation it verifies that the unit and tenant belong together in the landlord's scope, creates the invoice, and applies available tenant credits to eligible invoices in the caller's transaction. |

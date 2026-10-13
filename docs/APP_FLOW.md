@@ -64,7 +64,7 @@ flowchart TD
 | Screen/journey | API operation | Current capability and constraints |
 |---|---|---|
 | Home/context | `GET /api/v1/bff/landlord/me` | Returns membership context and property count. There is no dashboard aggregate endpoint. |
-| Property list/detail | `GET /api/v1/properties`, `GET /api/v1/properties/{property_id}` | Read-only. Property create, edit, and delete are unavailable. |
+| Property list/detail | `GET /api/v1/properties`, `GET /api/v1/properties/{property_id}`, `POST /api/v1/properties` | Read/create supported. Property edit and delete are unavailable. |
 | Unit management | `GET /api/v1/properties/{property_id}/units`, `POST /api/v1/properties/{property_id}/units`, `GET /api/v1/units/{unit_id}`, `PATCH /api/v1/units/{unit_id}` | Create/update supported. No delete route; occupancy is read-only and has no tenant lifecycle command. |
 | Tenant management | `GET /api/v1/tenants`, `GET /api/v1/tenants/{tenant_id}`, `POST /api/v1/tenants` | Read/create supported. Tenant edit, deactivation, reassignment, and delete are unavailable. |
 | Invoice management | `GET /api/v1/invoices`, `GET /api/v1/invoices/{invoice_id}`, `POST /api/v1/invoices` | Read/create supported. Invoice update, mark-paid, cancellation, and delete are unavailable. Server computes total and payment state. |

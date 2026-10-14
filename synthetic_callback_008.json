@@ -1,0 +1,30 @@
+{
+  "Body": {
+    "stkCallback": {
+      "MerchantRequestID": "SYNTH-MERCHANT-008",
+      "CheckoutRequestID": "SYNTH-CHECKOUT-008",
+      "ResultCode": 0,
+      "ResultDesc": "The service request is processed successfully.",
+      "CallbackMetadata": {
+        "Item": [
+          {
+            "Name": "Amount",
+            "Value": 15500
+          },
+          {
+            "Name": "MpesaReceiptNumber",
+            "Value": "SYNTHREC008"
+          },
+          {
+            "Name": "TransactionDate",
+            "Value": 20260911130000
+          },
+          {
+            "Name": "PhoneNumber",
+            "Value": 254798765432
+          }
+        ]
+      }
+    }
+  }
+}

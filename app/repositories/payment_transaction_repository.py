@@ -108,8 +108,6 @@ class PaymentTransactionRepository:
         payment_method: str,
         status: str = "COMPLETED",
     ) -> dict[str, Any]:
-        from app.models.payment_transaction import PaymentTransaction
-
         # Calculate completed_at in Python instead of using
         # CASE :status = 'COMPLETED' in PostgreSQL.
         completed_at = (
@@ -175,8 +173,6 @@ class PaymentTransactionRepository:
         self,
         mpesa_receipt_number: str,
     ) -> dict[str, Any] | None:
-        from app.models.payment_transaction import PaymentTransaction
-
         result = await self.db.execute(
             select(
                 PaymentTransaction.id,

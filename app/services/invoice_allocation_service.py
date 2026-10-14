@@ -60,6 +60,7 @@ class InvoiceAllocationService:
         payment_transaction_id: str,
         tenant_id: str,
         payment_amount: Decimal,
+        invoice_id: str | None = None,
     ) -> dict[str, Any]:
         requested_amount = Decimal(str(payment_amount))
         if requested_amount <= 0:
@@ -114,8 +115,14 @@ class InvoiceAllocationService:
             }
 
         # The invoice row is locked only after the payment lock above.
-        invoice = await self.invoice_repository.get_oldest_unpaid_for_tenant_for_update(
-            tenant_id=tenant_id,
+        invoice = (
+            await self.invoice_repository.get_for_tenant_for_update(
+                invoice_id=invoice_id, tenant_id=tenant_id
+            )
+            if invoice_id
+            else await self.invoice_repository.get_oldest_unpaid_for_tenant_for_update(
+                tenant_id=tenant_id,
+            )
         )
         if invoice is None:
             credit = await self.payment_credit_repository.create(
@@ -124,6 +131,14 @@ class InvoiceAllocationService:
                 amount=amount_to_allocate,
                 status="AVAILABLE",
             )
+            if invoice_id:
+                return {
+                    "status": "UNALLOCATED",
+                    "reason": "INVOICE_NO_LONGER_OUTSTANDING",
+                    "payment_transaction_id": payment_transaction_id,
+                    "payment_credit_id": str(credit["id"]),
+                    "credited_amount": amount_to_allocate,
+                }
             applications = await self._apply_credit_to_oldest_unpaid_invoices(
                 credit_id=str(credit["id"]),
                 tenant_id=tenant_id,
@@ -157,11 +172,7 @@ class InvoiceAllocationService:
 
         # This must be a separate statement after acquiring the invoice lock.
         allocated_for_invoice = Decimal(
-            str(
-                await self.invoice_repository.get_allocated_amount(
-                    invoice_id=invoice_id,
-                )
-            )
+            str(await self.invoice_repository.get_allocated_amount(invoice_id=invoice_id))
         )
 
         existing = await self.payment_allocation_repository.get(
@@ -225,10 +236,14 @@ class InvoiceAllocationService:
                 amount=excess_amount,
                 status="AVAILABLE",
             )
-            credit_applications = await self._apply_credit_to_oldest_unpaid_invoices(
-                credit_id=str(credit["id"]),
-                tenant_id=tenant_id,
-                credit_amount=excess_amount,
+            credit_applications = (
+                []
+                if invoice_id
+                else await self._apply_credit_to_oldest_unpaid_invoices(
+                    credit_id=str(credit["id"]),
+                    tenant_id=tenant_id,
+                    credit_amount=excess_amount,
+                )
             )
             credit_applied_amount = sum(
                 (Decimal(str(row["amount"])) for row in credit_applications),

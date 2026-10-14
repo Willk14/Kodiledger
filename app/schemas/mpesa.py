@@ -81,6 +81,20 @@ class StkPushRequest(BaseModel):
     )
 
 
+class InvoiceStkPushRequest(BaseModel):
+    """Phone number to prompt for an invoice's current balance."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    phone_number: str = Field(
+        min_length=12,
+        max_length=12,
+        pattern=r"^254\d{9}$",
+        description="Safaricom number in 254XXXXXXXXX format",
+        examples=["254798765432"],
+    )
+
+
 # ============================================================
 # STK PUSH RESPONSE
 # ============================================================

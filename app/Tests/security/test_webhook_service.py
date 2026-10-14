@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.schemas.mpesa import MpesaStkPushCallbackPayload
+from app.repositories.stk_push_request_repository import StkPushRequestRepository
 from app.services.webhook_service import WebhookService
 
 
@@ -25,8 +26,14 @@ def failed_service() -> tuple[WebhookService, AsyncMock, AsyncMock]:
 
 
 @pytest.mark.asyncio
-async def test_reconciliation_failure_rolls_back_and_releases_redis_lock():
+async def test_reconciliation_failure_rolls_back_and_releases_redis_lock(monkeypatch):
     service, reconciliation_service, idempotency_service = failed_service()
+
+    monkeypatch.setattr(
+        StkPushRequestRepository,
+        "mark_callback_received",
+        AsyncMock(return_value=(True, None)),
+    )
 
     db = AsyncMock()
 

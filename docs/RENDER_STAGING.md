@@ -45,7 +45,7 @@ If `kodiflow_app` already exists, do not rerun `CREATE ROLE`. Inspect its attrib
 
 ## 3. Apply the schema migrations
 
-Exit the SQL prompt (`\q`) and, from the backend repository root, apply every numbered file in `db/migrations/` in lexicographic order, from `0001_initial_schema.sql` through `0019_system_role_rls_policies.sql`, using the owner connection. The repository has no migration runner or migration-history table. Use `psql` with `ON_ERROR_STOP` and stop at the first error; do not skip a failed migration or rerun the whole sequence over a partially migrated database.
+Exit the SQL prompt (`\q`) and, from the backend repository root, apply every numbered file in `db/migrations/` in lexicographic order, from `0001_initial_schema.sql` through `0020_invoice_stk_push.sql`, using the owner connection. The repository has no migration runner or migration-history table. Use `psql` with `ON_ERROR_STOP` and stop at the first error; do not skip a failed migration or rerun the whole sequence over a partially migrated database.
 
 Example for one migration (repeat for each file in order, entering the owner password only at the prompt):
 
@@ -75,6 +75,7 @@ The complete ordered migration list is:
 0017_payment_credit_applications.sql
 0018_identity_lookup_rls.sql
 0019_system_role_rls_policies.sql
+0020_invoice_stk_push.sql
 ```
 
 ## 4. Apply the application-role grants

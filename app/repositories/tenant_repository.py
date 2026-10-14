@@ -133,3 +133,23 @@ class TenantRepository:
             return None
 
         return dict(tenant)
+
+    async def get_active_for_invoice(
+        self, *, invoice_id: str, landlord_id: str
+    ) -> dict | None:
+        result = await self.db.execute(
+            text("""
+                SELECT t.id, t.landlord_id, t.unit_id
+                FROM tenants t
+                JOIN invoices i ON i.tenant_id = t.id
+                               AND i.unit_id = t.unit_id
+                               AND i.landlord_id = t.landlord_id
+                WHERE i.id = :invoice_id
+                  AND i.landlord_id = :landlord_id
+                  AND t.is_active = TRUE
+                LIMIT 1
+            """),
+            {"invoice_id": invoice_id, "landlord_id": landlord_id},
+        )
+        tenant = result.mappings().first()
+        return dict(tenant) if tenant else None

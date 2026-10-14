@@ -47,6 +47,52 @@ class InvoiceRepository:
         )
         return result.scalar_one_or_none()
 
+    async def get_stk_payment_context(
+        self, *, invoice_id: str, landlord_id: str
+    ) -> dict[str, Any] | None:
+        result = await self.db.execute(
+            text("""
+                SELECT i.id, i.tenant_id, i.unit_id, i.is_paid,
+                       i.invoice_number, i.total_amount,
+                       i.total_amount - COALESCE((
+                           SELECT SUM(pa.amount)
+                           FROM payment_allocations pa
+                           WHERE pa.invoice_id = i.id AND pa.status = 'ALLOCATED'
+                       ), 0) - COALESCE((
+                           SELECT SUM(pca.amount)
+                           FROM payment_credit_applications pca
+                           WHERE pca.invoice_id = i.id
+                       ), 0) AS amount_due
+                FROM invoices i
+                JOIN tenants t ON t.id = i.tenant_id
+                             AND t.unit_id = i.unit_id
+                             AND t.landlord_id = i.landlord_id
+                WHERE i.id = :invoice_id
+                  AND i.landlord_id = :landlord_id
+                  AND t.is_active = TRUE
+                LIMIT 1
+            """),
+            {"invoice_id": invoice_id, "landlord_id": landlord_id},
+        )
+        row = result.mappings().first()
+        return dict(row) if row else None
+
+    async def get_for_tenant_for_update(
+        self, *, invoice_id: str, tenant_id: str
+    ) -> dict[str, Any] | None:
+        result = await self.db.execute(
+            text("""
+                SELECT i.id, i.tenant_id, i.invoice_number, i.total_amount
+                FROM invoices i
+                WHERE i.id = :invoice_id AND i.tenant_id = :tenant_id
+                  AND i.is_paid = FALSE
+                FOR UPDATE OF i
+            """),
+            {"invoice_id": invoice_id, "tenant_id": tenant_id},
+        )
+        row = result.mappings().first()
+        return dict(row) if row else None
+
     async def unit_belongs_to_landlord(
         self,
         *,

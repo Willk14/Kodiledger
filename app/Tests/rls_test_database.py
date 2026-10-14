@@ -203,6 +203,15 @@ async def _apply_migrations(connection: asyncpg.Connection) -> None:
         await connection.execute(
             (MIGRATIONS / "0019_system_role_rls_policies.sql").read_text(encoding="utf-8")
         )
+        invoice_stk_column_exists = await connection.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = 'stk_push_requests' "
+            "AND column_name = 'invoice_id')"
+        )
+        if not invoice_stk_column_exists:
+            await connection.execute(
+                (MIGRATIONS / "0020_invoice_stk_push.sql").read_text(encoding="utf-8")
+            )
         return
 
     for migration in sorted(MIGRATIONS.glob("*.sql")):

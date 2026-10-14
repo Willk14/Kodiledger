@@ -97,16 +97,25 @@ class WebhookService:
             # Only callbacks correlated to a request created from Daraja's
             # successful STK initiation response may enter the durable inbox.
             # Replays are already trusted inbox records and bypass this gate.
+            invoice_id: str | None = None
             if persist_inbox:
-                matched_request = await StkPushRequestRepository(
-                    db
-                ).mark_callback_received(
+                stk_requests = StkPushRequestRepository(db)
+                matched_request, invoice_id = await stk_requests.mark_callback_received(
                     merchant_request_id, checkout_request_id
                 )
                 if not matched_request:
                     raise UnmatchedStkCallback(
                         "Callback does not match an initiated STK request."
                     )
+            else:
+                request_record = await StkPushRequestRepository(
+                    db
+                ).get_by_checkout_id(checkout_request_id)
+                if request_record is None:
+                    raise UnmatchedStkCallback(
+                        "Retry callback no longer matches an STK request."
+                    )
+                invoice_id = request_record["invoice_id"]
 
             # ====================================================
             # 2. Persist the raw webhook
@@ -270,6 +279,8 @@ class WebhookService:
                     merchant_request_id=merchant_request_id,
                     checkout_request_id=checkout_request_id,
                     account_ref=None,
+                    invoice_id=invoice_id,
+                    payer_name=None,
                 )
             )
 

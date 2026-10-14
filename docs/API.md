@@ -166,7 +166,9 @@ Invoice responses expose `id`, `unit_id`, `tenant_id`, `invoice_number`, `billin
 
 ### IMPLEMENTED — initiate STK Push
 
-`POST /api/v1/payments/stk-push` accepts JSON and returns HTTP 200 when the initiation service returns a mapping. This route has **no user authentication or RBAC dependency**. It is limited by caller IP through Redis, with defaults of 5 requests per 60 seconds; both are configurable.
+`POST /api/v1/payments/stk-push` accepts JSON and returns HTTP 200 when the initiation service returns a mapping. This legacy route has no user authentication and is limited by caller IP through Redis, with defaults of 5 requests per 60 seconds.
+
+`POST /api/v1/payments/invoices/{invoice_id}/stk-push` requires a landlord with `PAYMENT_CREATE`, checks invoice and active-tenant ownership in that landlord scope, derives the outstanding amount from the invoice's total less recorded allocations and applied credits, and accepts only the phone number (`254XXXXXXXXX`). It records the provider checkout request against the selected invoice; the callback then allocates the payment to that invoice instead of the tenant's oldest unpaid invoice. The invoice amount must be a positive whole-KES balance because Daraja STK Push takes integer KES. When the invoice is no longer payable by callback time, the payment is retained as tenant credit rather than reassigned to a different invoice. Apply migration `0020_invoice_stk_push.sql` before using this route.
 
 Accepted requests with Daraja merchant and checkout IDs are recorded in `stk_push_requests` for later status lookup. Recording happens after the external STK request is accepted; a database failure in that window can leave the provider request untracked.
 
@@ -222,6 +224,7 @@ Allocation and payment-credit detail routes also require `PAYMENT_READ` and firs
 |---|---|---|---|
 | `GET /api/v1/payments/{payment_id}/allocations` | List invoice allocation rows for a visible payment | 200, array of allocation objects (empty if none) | 401, 403, 404, 422, 500, 503 |
 | `GET /api/v1/payments/{payment_id}/credits` | List payment-credit rows created from a visible payment | 200, array of credit objects (empty if none) | 401, 403, 404, 422, 500, 503 |
+| `POST /api/v1/payments/invoices/{invoice_id}/stk-push` | Prompt a tenant for the outstanding balance of this landlord-owned invoice | 200, Daraja STK response | 400, 401, 403, 404, 409, 422, 429, 502, 503 |
 
 Allocation objects expose `id`, `payment_transaction_id`, `invoice_id`, `amount`, `status`, `created_at`, and `reversed_at`; allocation states are `ALLOCATED` and `REVERSED`. Credit objects expose `id`, `payment_transaction_id`, `tenant_id`, `amount`, `status`, `created_at`, and `applied_at`; credit states are `AVAILABLE`, `APPLIED`, `REFUNDED`, and `CANCELLED`. Monetary values serialize as Decimal strings. These endpoints are read-only. There is no generic `POST /api/v1/allocations`, `GET /api/v1/allocations`, or `GET /api/v1/allocations/{allocation_id}` route. Allocation writes are part of the existing unassigned-payment resolution command below; the API does not expose `InvoiceAllocationService` directly or let a caller select an arbitrary payment/invoice pair.
 
@@ -327,7 +330,7 @@ ACID describes the PostgreSQL transaction boundary; it does not make a multi-sys
 | `POST /api/v1/invoices` | ACID in PostgreSQL | Ownership checks, invoice insertion, and application of available payment credits run in the request transaction; errors roll it back. |
 | `POST /api/v1/unassigned-payments/{payment_id}/resolve` | ACID financial write set in PostgreSQL | Assignment, allocation or credit, ledger, processing state, and outbox writes commit together or roll back together. |
 | `POST /api/v1/webhooks/mpesa` | Mixed; ACID financial processing in PostgreSQL | The callback inbox is committed first. Reconciliation then commits its financial write set atomically. Redis is only a fast-path lock; retries cover processing failures. No distributed ACID transaction spans the provider or event transport. |
-| `POST /api/v1/payments/stk-push` | Basic external workflow; not end-to-end ACID | Safaricom is called first; a successful initiation may then be recorded in PostgreSQL. A database rollback cannot undo the provider request, and HTTP success does not confirm payment. |
+| `POST /api/v1/payments/stk-push`, `POST /api/v1/payments/invoices/{invoice_id}/stk-push` | Basic external workflow; not end-to-end ACID | Safaricom is called first; a successful initiation may then be recorded in PostgreSQL. A database rollback cannot undo the provider request, and HTTP success does not confirm payment. |
 | `GET /api/v1/payments/stk-push/unresolved` | Basic/read-only | Reads the operator queue; it does not reconcile payments. |
 | `POST /api/v1/payments/stk-push/{checkout_request_id}/query` | Basic external workflow; not end-to-end ACID | The API records query state around a Safaricom status call using separate database commits. Those commits cannot make the external call atomic with PostgreSQL. |
 

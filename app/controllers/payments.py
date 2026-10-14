@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import traceback
 from typing import Annotated, Any, Mapping
 from uuid import UUID
 
@@ -10,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.configs.database import get_system_db
 from app.core.rate_limiter import enforce_stk_push_rate_limit
-from app.schemas.mpesa import StkPushRequest, StkPushResponse
+from app.schemas.mpesa import InvoiceStkPushRequest, StkPushRequest, StkPushResponse
 from app.schemas.payment_transaction import PaymentTransactionRead
 from app.schemas.payment_financial_detail import (
     PaymentAllocationRead,
@@ -21,7 +20,8 @@ from app.repositories.payment_transaction_repository import PaymentTransactionRe
 from app.repositories.payment_allocation_repository import PaymentAllocationRepository
 from app.repositories.payment_credit_repository import PaymentCreditRepository
 from app.repositories.stk_push_request_repository import StkPushRequestRepository
-from app.security.authorization import require_landlord_context, require_roles_and_permission
+from app.repositories.invoice_repository import InvoiceRepository
+from app.security.authorization import require_landlord_context, require_role_and_permission, require_roles_and_permission
 from app.security.permissions import Permission
 from app.security.principals import Principal
 from app.security.roles import Role
@@ -51,6 +51,10 @@ PaymentOperator = Annotated[
     Principal,
     Depends(require_roles_and_permission(Permission.PAYMENT_READ, Role.ADMIN)),
 ]
+InvoicePaymentWriter = Annotated[
+    Principal,
+    Depends(require_role_and_permission(Role.LANDLORD, Permission.PAYMENT_CREATE)),
+]
 RlsSession = Annotated[AsyncSession, Depends(get_rls_db)]
 
 
@@ -64,6 +68,66 @@ def _financial_query_service(db: AsyncSession) -> PaymentFinancialQueryService:
         PaymentAllocationRepository(db),
         PaymentCreditRepository(db),
     )
+
+
+@router.post(
+    "/invoices/{invoice_id}/stk-push",
+    response_model=StkPushResponse,
+    summary="Initiate an STK Push for an outstanding invoice balance",
+    responses={404: {"description": "Invoice or active tenant not found in this landlord scope."}, 409: {"description": "Invoice has no amount due."}},
+)
+async def initiate_invoice_stk_push(
+    invoice_id: UUID,
+    request: InvoiceStkPushRequest,
+    principal: InvoicePaymentWriter,
+    db: RlsSession,
+    _: None = Depends(enforce_stk_push_rate_limit),
+    system_db: AsyncSession = Depends(get_system_db),
+) -> StkPushResponse:
+    landlord_id = str(UUID(require_landlord_context(principal)))
+    invoices = InvoiceRepository(db)
+    invoice = await invoices.get_stk_payment_context(
+        invoice_id=str(invoice_id), landlord_id=landlord_id
+    )
+    if invoice is None:
+        raise HTTPException(status_code=404, detail="Invoice or active tenant not found in this landlord scope.")
+    if invoice["is_paid"]:
+        raise HTTPException(status_code=409, detail="Invoice is already paid.")
+    amount_due = invoice["amount_due"]
+    if amount_due <= 0:
+        raise HTTPException(status_code=409, detail="Invoice has no outstanding balance.")
+    if amount_due != int(amount_due):
+        raise HTTPException(status_code=409, detail="STK Push requires a whole KES amount; invoice has a fractional balance.")
+
+    await db.commit()
+    try:
+        response = await payment_initiation_service.initiate_mpesa_stk_push(
+            phone_number=request.phone_number,
+            amount=int(amount_due),
+            account_reference=str(invoice["invoice_number"])[:12],
+            transaction_description=f"Rent {invoice['invoice_number']}"[:20],
+        )
+        if not isinstance(response, Mapping):
+            raise RuntimeError("M-Pesa service returned an invalid response.")
+        merchant_id = response.get("MerchantRequestID")
+        checkout_id = response.get("CheckoutRequestID")
+        if not merchant_id or not checkout_id:
+            raise RuntimeError("M-Pesa did not return a checkout request ID.")
+        await StkPushRequestRepository(system_db).record_initiation(
+            str(merchant_id), str(checkout_id), str(invoice_id)
+        )
+        await system_db.commit()
+        return _build_stk_push_response(response)
+    except ValueError as exc:
+        await system_db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        await system_db.rollback()
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        await system_db.rollback()
+        logger.exception("Invoice STK Push initiation failed")
+        raise HTTPException(status_code=502, detail="Failed to initiate invoice STK Push.") from exc
 
 
 def _tenant_scope(principal: Principal) -> UUID | None:
@@ -82,14 +146,10 @@ async def _list_for_principal(
     service: PaymentQueryService,
 ) -> list[PaymentTransactionRead]:
     landlord_id = UUID(require_landlord_context(principal))
-    if principal.role is Role.TENANT:
-        if principal.tenant_id is None:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Tenant scope is required.",
-            )
+    tenant_id = _tenant_scope(principal)
+    if tenant_id is not None:
         payments = await service.list_for_tenant(
-            tenant_id=UUID(principal.tenant_id),
+            tenant_id=tenant_id,
             landlord_id=landlord_id,
         )
     else:
@@ -160,15 +220,11 @@ async def get_payment_transaction(
 ) -> PaymentTransactionRead:
     landlord_id = UUID(require_landlord_context(principal))
     service = _query_service(db)
-    if principal.role is Role.TENANT:
-        if principal.tenant_id is None:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Tenant scope is required.",
-            )
+    tenant_id = _tenant_scope(principal)
+    if tenant_id is not None:
         payment = await service.get_for_tenant(
             payment_id=payment_id,
-            tenant_id=UUID(principal.tenant_id),
+            tenant_id=tenant_id,
             landlord_id=landlord_id,
         )
     else:
@@ -321,34 +377,7 @@ async def initiate_stk_push(
             detail=str(exc),
         ) from exc
 
-    except Exception as exc:
-        # Temporary diagnostic logging while we locate the 500.
-        print(
-            "\n" + "=" * 80,
-            flush=True,
-        )
-        print(
-            "STK PUSH EXCEPTION",
-            flush=True,
-        )
-        print(
-            f"TYPE: {type(exc).__name__}",
-            flush=True,
-        )
-        print(
-            f"MESSAGE: {exc}",
-            flush=True,
-        )
-        print(
-            "TRACEBACK:",
-            flush=True,
-        )
-        traceback.print_exc()
-        print(
-            "=" * 80 + "\n",
-            flush=True,
-        )
-
+    except Exception:
         logger.exception(
             "Unexpected STK Push initiation failure"
         )

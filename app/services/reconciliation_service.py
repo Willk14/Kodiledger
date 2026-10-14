@@ -75,6 +75,7 @@ class ReconciliationService:
         checkout_request_id: str | None = None,
         account_ref: str | None = None,
         payer_name: str | None = None,
+        invoice_id: str | None = None,
     ) -> dict:
         """
         Reconcile a successful M-Pesa payment.
@@ -96,9 +97,15 @@ class ReconciliationService:
         # 1. Find tenant
         # ========================================================
 
-        tenant = await self.tenant_repository.get_active_by_phone(
-            phone=phone,
-            landlord_id=landlord_id,
+        tenant = (
+            await self.tenant_repository.get_active_for_invoice(
+                invoice_id=invoice_id, landlord_id=landlord_id
+            )
+            if invoice_id
+            else await self.tenant_repository.get_active_by_phone(
+                phone=phone,
+                landlord_id=landlord_id,
+            )
         )
 
         tenant_id = str(tenant["id"]) if tenant else None
@@ -157,6 +164,7 @@ class ReconciliationService:
                 payment_transaction_id=payment_transaction_id,
                 tenant_id=tenant_id,
                 payment_amount=amount,
+                invoice_id=invoice_id,
             )
         )
 

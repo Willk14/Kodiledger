@@ -6,8 +6,10 @@ import pytest
 from fastapi import Depends, HTTPException, status
 from fastapi.testclient import TestClient
 from fastapi.security import HTTPAuthorizationCredentials
+from unittest.mock import AsyncMock
 
 from app.main import app
+from app.configs.database import get_db
 from app.security.dependencies import bearer_scheme, get_current_principal
 from app.security.principals import AuthenticatedContext
 from app.security.roles import Role
@@ -100,7 +102,7 @@ def test_property_openapi_matches_documented_read_contract():
     collection = paths["/api/v1/properties"]
     detail = paths["/api/v1/properties/{property_id}"]
 
-    assert set(collection) == {"get"}
+    assert set(collection) == {"get", "post"}
     assert set(detail) == {"get"}
     assert collection["get"]["security"] == [{"HTTPBearer": []}]
     assert detail["get"]["security"] == [{"HTTPBearer": []}]
@@ -368,6 +370,14 @@ def test_landlord_can_access_landlord_endpoint():
         role="LANDLORD",
     )
 
+    db = AsyncMock()
+    db_result = type("Result", (), {"scalar_one": lambda _self: 0})()
+    db.execute.return_value = db_result
+
+    async def override_db():
+        yield db
+
+    app.dependency_overrides[get_db] = override_db
     response = client.get(
         "/api/v1/bff/landlord/me",
         headers={
@@ -382,6 +392,7 @@ def test_landlord_can_access_landlord_endpoint():
     assert data["user_id"] == user_id
     assert data["role"] == "LANDLORD"
     assert data["landlord_id"] == LANDLORD_SCOPE
+    app.dependency_overrides.pop(get_db, None)
 
 
 def test_landlord_openapi_matches_context_contract():
@@ -571,6 +582,7 @@ def test_registered_api_surface_matches_frozen_openapi_contract():
         "/api/v1/payments/{payment_id}/allocations": {"get"},
         "/api/v1/payments/{payment_id}/credits": {"get"},
         "/api/v1/payments/stk-push": {"post"},
+        "/api/v1/payments/invoices/{invoice_id}/stk-push": {"post"},
         "/api/v1/payments/stk-push/unresolved": {"get"},
         "/api/v1/payments/stk-push/{checkout_request_id}/query": {"post"},
         "/api/v1/properties": {"get", "post"},

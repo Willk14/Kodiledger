@@ -12,13 +12,14 @@ class StkPushRequestRepository:
         self.db = db
 
     async def record_initiation(
-        self, merchant_request_id: str, checkout_request_id: str
+        self, merchant_request_id: str, checkout_request_id: str,
+        invoice_id: str | None = None,
     ) -> None:
         await self.db.execute(
             text("""
                 INSERT INTO stk_push_requests (
                     merchant_request_id, checkout_request_id,
-                    request_status, callback_received_at
+                    request_status, callback_received_at, invoice_id
                 ) VALUES (
                     :merchant_id, CAST(:checkout_id AS VARCHAR(100)),
                     CASE WHEN EXISTS (
@@ -26,17 +27,19 @@ class StkPushRequestRepository:
                         WHERE checkout_request_id = CAST(:checkout_id AS VARCHAR(100))
                     ) THEN 'CALLBACK_RECEIVED' ELSE 'PENDING' END,
                     (SELECT min(created_at) FROM raw_payment_webhooks
-                     WHERE checkout_request_id = CAST(:checkout_id AS VARCHAR(100)))
+                     WHERE checkout_request_id = CAST(:checkout_id AS VARCHAR(100))),
+                    :invoice_id
                 )
                 ON CONFLICT (checkout_request_id) DO NOTHING
             """),
-            {"merchant_id": merchant_request_id, "checkout_id": checkout_request_id},
+            {"merchant_id": merchant_request_id, "checkout_id": checkout_request_id,
+             "invoice_id": invoice_id},
         )
 
     async def get_by_checkout_id(self, checkout_request_id: str) -> dict[str, Any] | None:
         result = await self.db.execute(
             text("""
-                SELECT id, merchant_request_id, checkout_request_id,
+                SELECT id, merchant_request_id, checkout_request_id, invoice_id,
                        request_status, query_count, callback_received_at
                 FROM stk_push_requests
                 WHERE checkout_request_id = :checkout_id
@@ -121,7 +124,7 @@ class StkPushRequestRepository:
 
     async def mark_callback_received(
         self, merchant_request_id: str, checkout_request_id: str
-    ) -> bool:
+    ) -> tuple[bool, str | None]:
         result = await self.db.execute(
             text("""
                 UPDATE stk_push_requests
@@ -129,10 +132,12 @@ class StkPushRequestRepository:
                     callback_received_at = COALESCE(callback_received_at, now())
                 WHERE checkout_request_id = :checkout_id
                   AND merchant_request_id = :merchant_id
+                RETURNING invoice_id
             """),
             {"checkout_id": checkout_request_id, "merchant_id": merchant_request_id},
         )
         # The update both verifies the exact provider-issued identifier pair
         # and records callback receipt atomically. A repeated callback still
         # matches and remains idempotently accepted.
-        return bool(result.rowcount)
+        row = result.mappings().first()
+        return (True, str(row["invoice_id"]) if row["invoice_id"] else None) if row else (False, None)

@@ -113,3 +113,87 @@ async def test_reconciliation_failure_rolls_back_and_releases_redis_lock(monkeyp
         delay_seconds=30,
     )
 
+
+
+def success_payload() -> MpesaStkPushCallbackPayload:
+    return MpesaStkPushCallbackPayload(
+        Body={
+            "stkCallback": {
+                "MerchantRequestID": "TEST-MERCHANT",
+                "CheckoutRequestID": "TEST-CHECKOUT",
+                "ResultCode": 0,
+                "ResultDesc": "The service request is processed successfully.",
+                "CallbackMetadata": {
+                    "Item": [
+                        {"Name": "Amount", "Value": 1},
+                        {"Name": "MpesaReceiptNumber", "Value": "TEST-RECEIPT-002"},
+                        {"Name": "PhoneNumber", "Value": "254700000001"},
+                    ]
+                },
+            }
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_error_before_inbox_commit_still_saves_callback_for_retry(monkeypatch):
+    service, reconciliation_service, _ = failed_service()
+    monkeypatch.setattr(
+        StkPushRequestRepository,
+        "mark_callback_received",
+        AsyncMock(side_effect=RuntimeError("forced schema failure")),
+    )
+    db = AsyncMock()
+    service.webhook_repository.create_raw_webhook.return_value = "saved-id"
+
+    result = await service.process_mpesa_callback(payload=success_payload(), db=db)
+
+    assert result["ResultCode"] == 1
+    service.webhook_repository.create_raw_webhook.assert_awaited_once()
+    service.webhook_repository.schedule_retry.assert_awaited_once_with(
+        "saved-id", "forced schema failure", delay_seconds=30
+    )
+    db.commit.assert_awaited_once()
+    reconciliation_service.reconcile_payment.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_invoice_callback_uses_invoice_landlord_not_shortcode(monkeypatch):
+    service, reconciliation_service, idempotency_service = failed_service()
+    monkeypatch.setattr(
+        StkPushRequestRepository,
+        "mark_callback_received",
+        AsyncMock(return_value=(True, "invoice-id")),
+    )
+    service.webhook_repository.create_raw_webhook.return_value = "raw-id"
+    service.landlord_repository.get_by_invoice_id.return_value = "invoice-landlord"
+    idempotency_service.acquire.return_value = (True, "token")
+    service.payment_processing_repository.claim_payment.return_value = True
+    reconciliation_service.reconcile_payment.return_value = {"status": "MATCHED"}
+
+    result = await service.process_mpesa_callback(payload=success_payload(), db=AsyncMock())
+
+    assert result["ResultCode"] == 0
+    service.landlord_repository.get_by_invoice_id.assert_awaited_once_with("invoice-id")
+    service.landlord_repository.get_by_business_shortcode.assert_not_awaited()
+    assert reconciliation_service.reconcile_payment.await_args.kwargs["landlord_id"] == "invoice-landlord"
+
+
+@pytest.mark.asyncio
+async def test_replay_rejects_merchant_mismatch_and_counts_attempt(monkeypatch):
+    service, reconciliation_service, _ = failed_service()
+    monkeypatch.setattr(
+        StkPushRequestRepository,
+        "get_by_checkout_id",
+        AsyncMock(return_value={"merchant_request_id": "OTHER", "invoice_id": None}),
+    )
+    db = AsyncMock()
+
+    result = await service.process_mpesa_callback(
+        payload=success_payload(), db=db, raw_webhook_id="raw-id", persist_inbox=False
+    )
+
+    assert result["ResultCode"] == 1
+    service.webhook_repository.schedule_retry.assert_awaited_once()
+    service.webhook_repository.create_raw_webhook.assert_not_awaited()
+    reconciliation_service.reconcile_payment.assert_not_awaited()

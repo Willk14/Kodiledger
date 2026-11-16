@@ -77,6 +77,7 @@ class WebhookService:
 
         redis_receipt: str | None = None
         redis_token: str | None = None
+        inbox_saved = not persist_inbox
 
         try:
             # ====================================================
@@ -111,7 +112,12 @@ class WebhookService:
                 request_record = await StkPushRequestRepository(
                     db
                 ).get_by_checkout_id(checkout_request_id)
-                if request_record is None:
+                # Inbox rows saved after an error never passed the live
+                # match, so replay must check both IDs itself.
+                if (
+                    request_record is None
+                    or request_record["merchant_request_id"] != merchant_request_id
+                ):
                     raise UnmatchedStkCallback(
                         "Retry callback no longer matches an STK request."
                     )
@@ -137,6 +143,7 @@ class WebhookService:
                 # The inbox is committed before financial processing so a
                 # crash or rollback cannot erase the provider's callback.
                 await db.commit()
+                inbox_saved = True
 
             receipt, amount, phone = self._extract_payment_metadata(
                 stk_data
@@ -190,11 +197,13 @@ class WebhookService:
             # 5. Resolve landlord
             # ====================================================
 
+            # An invoice STK push already names its landlord; the shortcode
+            # can be shared (e.g. the sandbox), so it is only a fallback.
             landlord_id = (
-                await self.landlord_repository
-                .get_by_business_shortcode(
-                    str(settings.MPESA_SHORTCODE)
-                )
+                invoice_id
+                and await self.landlord_repository.get_by_invoice_id(invoice_id)
+            ) or await self.landlord_repository.get_by_business_shortcode(
+                str(settings.MPESA_SHORTCODE)
             )
 
             if not landlord_id:
@@ -327,11 +336,19 @@ class WebhookService:
                 "reconciliation": reconciliation,
             }
 
-        except UnmatchedStkCallback:
+        except UnmatchedStkCallback as exc:
             # This is an untrusted callback, not a transient processing
             # failure. Do not save it to the retryable inbox.
             await db.rollback()
-            raise
+            if persist_inbox:
+                raise
+            # On replay, count the attempt so the row exhausts instead of
+            # being re-claimed forever.
+            await self.webhook_repository.schedule_retry(
+                raw_webhook_id, str(exc), delay_seconds=retry_delay_seconds
+            )
+            await db.commit()
+            return {"ResultCode": 1, "ResultDesc": str(exc)}
 
         except Exception as exc:
             # ====================================================
@@ -341,9 +358,20 @@ class WebhookService:
             await db.rollback()
 
             # Keep the already committed inbox row and schedule an internal
-            # retry after rolling back all financial writes.
-            if raw_webhook_id:
+            # retry after rolling back all financial writes. If the error hit
+            # before the inbox commit, save the callback now: the provider
+            # already gets a 200 and will not resend it. Replay re-checks it
+            # against stk_push_requests before any financial write.
+            if raw_webhook_id or not inbox_saved:
                 try:
+                    if not inbox_saved:
+                        stk = payload.Body.stkCallback
+                        raw_webhook_id = await self.webhook_repository.create_raw_webhook(
+                            merchant_request_id=stk.MerchantRequestID,
+                            checkout_request_id=stk.CheckoutRequestID,
+                            receipt=None,
+                            raw_payload=payload.model_dump(mode="json"),
+                        )
                     await self.webhook_repository.schedule_retry(
                         raw_webhook_id,
                         str(exc),

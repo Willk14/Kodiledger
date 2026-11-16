@@ -22,6 +22,15 @@ class LandlordRepository:
         )
         return int(result.scalar_one())
 
+    async def get_by_invoice_id(self, invoice_id: str) -> str | None:
+        """Return the landlord UUID that owns an invoice."""
+        result = await self.db.execute(
+            text("SELECT landlord_id FROM invoices WHERE id = :id"),
+            {"id": str(invoice_id)},
+        )
+        landlord_id = result.scalar_one_or_none()
+        return str(landlord_id) if landlord_id else None
+
     async def get_by_business_shortcode(
         self,
         shortcode: str,

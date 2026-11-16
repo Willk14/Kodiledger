@@ -377,7 +377,7 @@ async def initiate_stk_push(
             detail=str(exc),
         ) from exc
 
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "Unexpected STK Push initiation failure"
         )

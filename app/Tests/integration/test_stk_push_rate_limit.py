@@ -8,6 +8,7 @@ import redis.asyncio as redis
 from fastapi import FastAPI
 
 import app.controllers.payments as payments_module
+from app.configs.database import get_system_db
 from app.configs.environment import settings
 from app.core.rate_limiter import rate_limiter
 
@@ -23,6 +24,8 @@ async def test_stk_push_rate_limit_blocks_sixth_request(
         payments_module.router,
         prefix="/api/v1",
     )
+    # This test covers rate limiting only; keep it off the real system database.
+    test_app.dependency_overrides[get_system_db] = lambda: AsyncMock()
 
     mock_stk_push = AsyncMock(
         return_value={

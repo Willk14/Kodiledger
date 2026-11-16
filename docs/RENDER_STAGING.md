@@ -45,38 +45,22 @@ If `kodiflow_app` already exists, do not rerun `CREATE ROLE`. Inspect its attrib
 
 ## 3. Apply the schema migrations
 
-Exit the SQL prompt (`\q`) and, from the backend repository root, apply every numbered file in `db/migrations/` in lexicographic order, from `0001_initial_schema.sql` through `0020_invoice_stk_push.sql`, using the owner connection. The repository has no migration runner or migration-history table. Use `psql` with `ON_ERROR_STOP` and stop at the first error; do not skip a failed migration or rerun the whole sequence over a partially migrated database.
-
-Example for one migration (repeat for each file in order, entering the owner password only at the prompt):
+Exit the SQL prompt (`\q`) and, from the backend repository root, run the migration runner with the **owner** connection. It applies every file in `db/migrations/` that is not yet recorded in `schema_migrations`, in order, records each one inside the same transaction, holds an advisory lock so two runs cannot overlap, and stops at the first error. Set `MIGRATION_DATABASE_URL` only in the shell running the command; never put the owner URL in a Render service or source control.
 
 ```powershell
-psql -W -v ON_ERROR_STOP=1 -h <external-host> -p <port> -U <database-owner> -d <database-name> -f .\db\migrations\0001_initial_schema.sql
+$env:MIGRATION_DATABASE_URL = "postgresql://<database-owner>:<password>@<external-host>:<port>/<database-name>"
+python -m app.core.migrations
+Remove-Item Env:MIGRATION_DATABASE_URL
 ```
 
-The complete ordered migration list is:
+**Database migrated by hand before the runner existed:** it has the schema but no `schema_migrations` rows, and the runner refuses to guess. Confirm the last migration actually applied (for example, `0020` adds `stk_push_requests.invoice_id`), mark everything up to it as applied, then run the runner normally to apply the rest:
 
-```text
-0001_initial_schema.sql
-0002_payment_processing.sql
-0003_add_payment_processing_processed_at.sql
-0004_payment_transactions.sql
-0005_payment_allocations.sql
-0006_link_ledger_to_payment_transaction.sql
-0007_payment_credits.sql
-0008_add_financial_query_indexes.sql
-0009_outbox_events.sql
-0010_row_level_security.sql
-0011_rls_role_hardening.sql
-0012_outbox_claiming.sql
-0013_authenticated_identity.sql
-0014_webhook_inbox_retries.sql
-0015_stk_status_queries.sql
-0016_scoped_outbox_app_access.sql
-0017_payment_credit_applications.sql
-0018_identity_lookup_rls.sql
-0019_system_role_rls_policies.sql
-0020_invoice_stk_push.sql
+```powershell
+python -m app.core.migrations --baseline 0020
+python -m app.core.migrations
 ```
+
+The API refuses to start while any migration file is unrecorded and lists the missing versions in its startup error. Run the runner before deploying code that ships a new migration.
 
 ## 4. Apply the application-role grants
 
@@ -105,7 +89,7 @@ WHERE rolname IN ('kodiflow_app', 'kodiflow_system')
 ORDER BY rolname;
 ```
 
-Expected: both roles can log in; neither is a superuser, role creator, or RLS-bypass role (`rolbypassrls = false`). Confirm that `kodiflow_system` has the explicit `kodiflow_system_access` policy on every RLS-protected table required by the migration. Also verify that all 19 migration files completed without errors. This is setup verification only; it is not a test of API authorization or RLS isolation.
+Expected: both roles can log in; neither is a superuser, role creator, or RLS-bypass role (`rolbypassrls = false`). Confirm that `kodiflow_system` has the explicit `kodiflow_system_access` policy on every RLS-protected table required by the migration. Also verify that the migration runner reported no pending migrations. This is setup verification only; it is not a test of API authorization or RLS isolation.
 
 ## 6. Configure the Render API variables
 
@@ -132,6 +116,18 @@ Create a **Web Service** from the backend Git repository and select the **Stagin
 Add the service variables from the prior section before deployment. Verify that the two database URLs use the **internal** Render Postgres host, the app and system role credentials respectively, and the same Staging database. Use the internal Render Key Value URL for `REDIS_URL`. Never paste complete URLs or passwords into chat, source control, or deployment logs. The app checks both PostgreSQL connections during startup; an incorrect URL prevents the service from becoming ready.
 
 The API alone does not drain the transactional outbox. The worker in `app/workers/outbox.py` must run as a separate Background Worker with the database URLs and other required settings configured, plus a reachable Kafka broker configured through `KAFKA_BOOTSTRAP_SERVERS`. Do not treat payment event delivery as staged until that broker and worker are deployed and verified. The repository currently does not provision a hosted Kafka broker.
+
+## 8. Create the webhook retry worker
+
+M-Pesa callbacks that fail during processing are kept in `raw_payment_webhooks` and retried only by `app/workers/webhook_replay.py`. Without this worker, a tenant's payment can be acknowledged to Safaricom but never recorded. Create a **Background Worker** from the same repository and Staging environment:
+
+| Setting | Value |
+| --- | --- |
+| Runtime | Python 3 |
+| Build Command | `pip install -r requirements.txt` |
+| Start Command | `python -m app.workers.webhook_replay` |
+
+Give it the same `DATABASE_URL`, `SYSTEM_DATABASE_URL`, `REDIS_URL`, M-Pesa, OIDC, and `ENVIRONMENT` variables as the API; it connects through the system role. Run a single instance; extra instances are safe (claims use `FOR UPDATE SKIP LOCKED`) but unnecessary. Its log prints `Webhook replay worker started` and then only logs when it processes or fails a callback. Callbacks that keep failing stop after 10 attempts with `retry_exhausted_at` set; check for those and for unprocessed rows older than 15 minutes.
 
 After the web service deploys, verify the Render logs and open its HTTPS URL. `GET /` should return the basic online response; successful startup also confirms the two database connections succeeded. This does not verify RLS isolation, authenticated routes, M-Pesa callbacks, or outbox publication.
 

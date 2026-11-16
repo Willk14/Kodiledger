@@ -29,6 +29,7 @@ from app.configs.app import (
     configure_cors,
 )
 from app.configs.database import engine, system_engine
+from app.core.migrations import pending
 
 
 async def _check_database_connection(database_engine: AsyncEngine, name: str) -> None:
@@ -40,12 +41,31 @@ async def _check_database_connection(database_engine: AsyncEngine, name: str) ->
         raise RuntimeError(f"Could not connect to the {name} database.") from None
 
 
+async def _check_migrations(database_engine: AsyncEngine) -> None:
+    # Code running against an older schema can fail mid-payment, after M-Pesa
+    # has already been acknowledged, so refuse to serve instead.
+    async with database_engine.connect() as connection:
+        if await connection.scalar(text("SELECT to_regclass('public.schema_migrations')")):
+            rows = await connection.execute(text("SELECT version FROM schema_migrations"))
+            applied = {row[0] for row in rows}
+        else:
+            applied = set()
+    missing = pending(applied)
+    if missing:
+        raise RuntimeError(
+            "Database has unapplied migrations: "
+            + ", ".join(missing)
+            + ". Run `python -m app.core.migrations` with the owner connection."
+        )
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     try:
         # Validate both configured PostgreSQL roles before serving requests.
         await _check_database_connection(engine, "application")
         await _check_database_connection(system_engine, "system")
+        await _check_migrations(system_engine)
         yield
     finally:
         await engine.dispose()
